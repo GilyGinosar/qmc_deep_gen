@@ -1,5 +1,5 @@
 
-from vocalizations.qmc_deep_gen.data.bird_data import load_gerbils,bird_data
+from data.bird_data import load_gerbils,bird_data
 from torch.utils.data import DataLoader
 import numpy as np
 import os

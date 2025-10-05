@@ -6,12 +6,12 @@ from torch.utils.data import DataLoader
 from pathlib import Path  # add near your imports
 
 # ==== project imports (same stack you used for training) ====
-from vocalizations.qmc_deep_gen.data.bird_data import load_gerbils, bird_data
-from vocalizations.qmc_deep_gen.models.sampling import gen_fib_basis  # latent grid for 2D
-from vocalizations.qmc_deep_gen.models.utils import get_decoder_arch
-from vocalizations.qmc_deep_gen.models.qmc_base import QMCLVM
-from vocalizations.qmc_deep_gen.train.losses import binary_evidence, binary_lp
-from vocalizations.qmc_deep_gen.train.train import test_epoch   # <- test loop
+from data.bird_data import load_gerbils, bird_data
+from models.sampling import gen_fib_basis  # latent grid for 2D
+from models.utils import get_decoder_arch
+from models.qmc_base import QMCLVM
+from train.losses import binary_evidence, binary_lp
+from train.train import test_epoch   # <- test loop
 
 # (optional) plotting helpers
 from plotting.visualize import model_grid_plot, qmc_train_plot, format_plot_axis

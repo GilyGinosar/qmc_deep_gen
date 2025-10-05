@@ -124,11 +124,13 @@ def train_loop(model,loader,base_sequence,loss_function,nEpochs=100,verbose=Fals
 
     for epoch in tqdm(range(nEpochs)):
         if verbose:
-            batch_loss,model,optimizer = train_epoch_verbose(model,optimizer,loader,base_sequence,loss_function,
-                                                             random=random,mod=mod,conditional=conditional,importance_weights=importance_weights)
+            batch_loss, model, optimizer = train_epoch_verbose(model, optimizer, loader, base_sequence, loss_function,
+                                                               random=random, mod=mod, conditional=conditional,
+                                                               importance_weights=importance_weights)
         else:
-            batch_loss,model,optimizer = train_epoch(model,optimizer,loader,base_sequence,loss_function,
-                                                     random=random,mod=mod,conditional=conditional,importance_weights=importance_weights)
+            batch_loss, model, optimizer = train_epoch(model, optimizer, loader, base_sequence, loss_function,
+                                                       random=random, mod=mod, conditional=conditional,
+                                                       importance_weights=importance_weights)
 
 
         losses += batch_loss
