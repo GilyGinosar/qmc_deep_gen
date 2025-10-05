@@ -56,6 +56,21 @@ def model_grid_plot(model,n_samples_dim,fn='',show=True,origin=None,cm='grey',mo
         plt.savefig(fn)
     plt.close()
 
+    # if show:
+    #     plt.show()
+    #     if not return_fig:
+    #         plt.close(fig)
+    # else:
+    #     plt.savefig(fn)
+    #     if not return_fig:
+    #         plt.close(fig)
+    #
+    #     # NEW: optionally return fig + an axes mapping like {"sample 0": ax, ...}
+    # if return_fig:
+    #     return fig, axes
+
+
+
 def conditional_qmc_grid_plot(model,n_samples_dim,c,fn='',show=True,origin=None,cm='grey',):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
