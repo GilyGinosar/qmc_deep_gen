@@ -2,7 +2,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.optim import Adam
 import torch
-from train.losses import jacEnergy
+from vocalizations.qmc_deep_gen.train.losses import jacEnergy
 
 
 def train_epoch(model,optimizer,loader,base_sequence,loss_function,random=True,mod=True,conditional=False):
@@ -71,25 +71,94 @@ def test_epoch(model,loader,base_sequence,loss_function,conditional=False):
 
     return epoch_losses
 
-def train_loop(model,loader,base_sequence,loss_function,nEpochs=100,verbose=False,
-               random=True,mod=True,conditional=False):
+# --- put near your imports ---
+import os, time, json, numpy as np, torch
 
-    optimizer = Adam(model.parameters(),lr=1e-3)
+def save_checkpoint(epoch, model, optimizer, losses, out_dir="runs", run_id=None, is_final=False, extra=None):
+    os.makedirs(out_dir, exist_ok=True)
+    run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    tag = f"final_{run_id}.pt" if is_final else f"ckpt_{run_id}_epoch{epoch:04d}.pt"
+    path = os.path.join(out_dir, tag)
+    tmp  = path + ".tmp"  # atomic-ish write on same volume
+
+    state = {
+        "epoch": epoch,                           # next epoch to run
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "losses": losses,                         # list of per-batch losses so far
+        "run_id": run_id,
+        "extra": extra or {},
+        "torch_version": torch.__version__,
+    }
+    torch.save(state, tmp)
+    os.replace(tmp, path)                        # atomic replace
+    # also dump losses alone for quick plotting in anything
+    np.save(os.path.join(out_dir, f"losses_{run_id}.npy"), np.asarray(losses, dtype=np.float32))
+    return path
+
+def load_checkpoint(path, model, optimizer=None, map_location="cpu"):
+    state = torch.load(path, map_location=map_location)
+    model.load_state_dict(state["model_state_dict"])
+    if optimizer is not None and "optimizer_state_dict" in state:
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+    return state["epoch"], state.get("losses", []), state
+
+from torch.optim import Adam
+from tqdm import tqdm
+
+def train_loop(model, loader, base_sequence, loss_function, nEpochs=100, verbose=False,
+               random=True, mod=True, conditional=False,
+               out_dir="runs", run_id=None, checkpoint_every=1):
+
+    optimizer = Adam(model.parameters(), lr=1e-3)
     losses = []
-    for epoch in tqdm(range(nEpochs)):
+    run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
 
+    for epoch in tqdm(range(nEpochs)):
         if verbose:
-            batch_loss,model,optimizer = train_epoch_verbose(model,optimizer,loader,base_sequence,loss_function,
-                                                 random=random,mod=mod,conditional=conditional)    
+            batch_loss, model, optimizer = train_epoch_verbose(
+                model, optimizer, loader, base_sequence, loss_function,
+                random=random, mod=mod, conditional=conditional)
         else:
-            batch_loss,model,optimizer = train_epoch(model,optimizer,loader,base_sequence,loss_function,
-                                                 random=random,mod=mod,conditional=conditional)
+            batch_loss, model, optimizer = train_epoch(
+                model, optimizer, loader, base_sequence, loss_function,
+                random=random, mod=mod, conditional=conditional)
 
         losses += batch_loss
-        if verbose:
-            print(f'Epoch {epoch + 1} Average loss: {np.sum(batch_loss)/len(loader.dataset):.4f}')
 
-    return model, optimizer,losses
+        if verbose:
+            print(f"Epoch {epoch+1} avg loss: {float(np.mean(batch_loss)):.4f}")
+
+        # save every N epochs
+        if checkpoint_every and ((epoch + 1) % checkpoint_every == 0):
+            save_checkpoint(epoch=epoch+1, model=model, optimizer=optimizer,
+                            losses=losses, out_dir=out_dir, run_id=run_id, is_final=False)
+
+    # final save
+    final_path = save_checkpoint(epoch=nEpochs, model=model, optimizer=optimizer,
+                                 losses=losses, out_dir=out_dir, run_id=run_id, is_final=True)
+    return model, optimizer, losses
+
+
+# def train_loop(model,loader,base_sequence,loss_function,nEpochs=100,verbose=False,
+#                random=True,mod=True,conditional=False):
+#
+#     optimizer = Adam(model.parameters(),lr=1e-3)
+#     losses = []
+#     for epoch in tqdm(range(nEpochs)):
+#
+#         if verbose:
+#             batch_loss,model,optimizer = train_epoch_verbose(model,optimizer,loader,base_sequence,loss_function,
+#                                                  random=random,mod=mod,conditional=conditional)
+#         else:
+#             batch_loss,model,optimizer = train_epoch(model,optimizer,loader,base_sequence,loss_function,
+#                                                  random=random,mod=mod,conditional=conditional)
+#
+#         losses += batch_loss
+#         if verbose:
+#             print(f'Epoch {epoch + 1} Average loss: {np.sum(batch_loss)/len(loader.dataset):.4f}')
+#
+#     return model, optimizer,losses
 
 def train_epoch_mc(model,optimizer,loader,mc_func,loss_function):
     #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
