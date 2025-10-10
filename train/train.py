@@ -10,15 +10,44 @@ def train_epoch(model,optimizer,loader,base_sequence,loss_function,random=True,m
 
     train_loss = 0
     epoch_losses = []
-    for batch_idx,batch in enumerate(loader):
-        data= batch[0]
-        data = data.to(model.device)
-        optimizer.zero_grad()
+    # ---------- training without conditionals -------------
+    # for batch_idx,batch in enumerate(loader):
+    #     data= batch[0]
+    #     data = data.to(model.device)
+    #     optimizer.zero_grad()
+    #     if conditional:
+    #         c = batch[1].to(torch.float32).to(model.device).view(1,-1)
+    #         samples = model(base_sequence,random,mod,c)
+    #     else:
+    #         samples = model(base_sequence,random,mod)
+
+    # ----------- training with conditionals -----------------
+    for batch_idx, batch in enumerate(loader):
         if conditional:
-            c = batch[1].to(torch.float32).to(model.device).view(1,-1)
-            samples = model(base_sequence,random,mod,c)
+            data, c, _ = batch
+            data = data.to(model.device)
+
+            # allow scalar or one-hot
+            c = c.to(torch.float32).to(model.device)
+            if c.dim() == 1:  # scalar bins -> [B] => [B,1]
+                c = c.view(-1, 1)
+            # if one-hot, it's already [B,3]; leave as-is
+
+            optimizer.zero_grad()
+
+            # one forward per sample condition (QMCLVM.forward expects c.shape[0] == 1)
+            outs = []
+            for i in range(c.shape[0]):
+                c_i = c[i:i + 1]  # [1,cond_dim]
+                out_i = model(base_sequence, random, mod, c_i)
+                outs.append(out_i)
+            samples = torch.cat(outs, dim=0)
         else:
-            samples = model(base_sequence,random,mod)
+            data, _ = batch
+            data = data.to(model.device)
+            optimizer.zero_grad()
+            samples = model(base_sequence, random, mod)
+
         if len(importance_weights) == 0:
             loss = loss_function(samples, data)
         else:
@@ -35,15 +64,40 @@ def train_epoch_verbose(model,optimizer,loader,base_sequence,loss_function,rando
 
     train_loss = 0
     epoch_losses = []
-    for batch_idx, batch in tqdm(enumerate(loader),total=len(loader)):
-        data = batch[0]
-        data = data.to(model.device)
-        optimizer.zero_grad()
+    # ---------- training without conditionals -------------
+    # for batch_idx, batch in tqdm(enumerate(loader),total=len(loader)):
+    #     data = batch[0]
+    #     data = data.to(model.device)
+    #     optimizer.zero_grad()
+    #     if conditional:
+    #         c = batch[1].to(torch.float32).to(model.device).view(1,-1)
+    #         samples = model(base_sequence,random,mod,c)
+    #     else:
+    #         samples = model(base_sequence,random,mod)
+
+    # ---------- training without conditionals -------------
+    for batch_idx, batch in tqdm(enumerate(loader), total=len(loader)):
         if conditional:
-            c = batch[1].to(torch.float32).to(model.device).view(1,-1)
-            samples = model(base_sequence,random,mod,c)
+            data, c, _ = batch
+            data = data.to(model.device)
+
+            c = c.to(torch.float32).to(model.device)
+            if c.dim() == 1:
+                c = c.view(-1, 1)
+
+            optimizer.zero_grad()
+            outs = []
+            for i in range(c.shape[0]):
+                c_i = c[i:i + 1]
+                out_i = model(base_sequence, random, mod, c_i)
+                outs.append(out_i)
+            samples = torch.cat(outs, dim=0)
         else:
-            samples = model(base_sequence,random,mod)
+            data, _ = batch
+            data = data.to(model.device)
+            optimizer.zero_grad()
+            samples = model(base_sequence, random, mod)
+
         if len(importance_weights) == 0:
             loss = loss_function(samples, data)
         else:
@@ -61,23 +115,42 @@ def test_epoch(model,loader,base_sequence,loss_function,conditional=False,random
 
     test_loss = 0
     epoch_losses = []
+    # ---------- training without conditionals -------------
+    # with torch.no_grad():
+    #     for batch_idx, batch in enumerate(tqdm(loader)):
+    #         data = batch[0]
+    #         data = data.to(model.device)
+    #         if conditional:
+    #             c = batch[1].to(torch.float32).to(model.device).view(1,-1)
+    #             samples = model(base_sequence,random=True,mod=True,c=c)
+    #         else:
+    #             samples = model(base_sequence,random=True,mod=True)
+
+    # ---------- training with conditionals -------------
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader)):
-            data = batch[0]
-            data = data.to(model.device)
             if conditional:
-                c = batch[1].to(torch.float32).to(model.device).view(1,-1)
-                samples = model(base_sequence,random=True,mod=True,c=c)
-            else:
-                samples = model(base_sequence,random=True,mod=True)
-            #samples = model(base_sequence)
-            if len(importance_weights) == 0:
-                loss = loss_function(samples, data)
-            else:
-                loss = loss_function(samples,data,importance_weights)
-            test_loss += loss.item()
-            epoch_losses.append(loss.item())
+                data, c, _ = batch
+                data = data.to(model.device)
 
+                c = c.to(torch.float32).to(model.device)
+                if c.dim() == 1:
+                    c = c.view(-1, 1)
+
+                outs = []
+                for i in range(c.shape[0]):
+                    c_i = c[i:i + 1]
+                    out_i = model(base_sequence, random=True, mod=True, c=c_i)
+                    outs.append(out_i)
+                samples = torch.cat(outs, dim=0)
+            else:
+                data, _ = batch
+                data = data.to(model.device)
+                samples = model(base_sequence, random=True, mod=True)
+            # added for conditional
+            loss = (loss_function(samples, data) if len(importance_weights) == 0
+                    else loss_function(samples, data, importance_weights))
+            epoch_losses.append(loss.item())
     return epoch_losses
 
 # --- put near your imports ---

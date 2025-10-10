@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 import numpy as np
 import os
 import torch
+import torch.nn as nn
+
 
 # Gily - Becasue I'm using Windows, can't use Miles's lambdas
 def spec_to_tensor(x: np.ndarray) -> torch.Tensor:
@@ -18,7 +20,6 @@ from tqdm import tqdm
 
 def load_gerbils_multi(gerbil_filepath, specs_per_file, families=[2],
                  test_size=0.2, seed=92, check=True):
-
     """
     gerbil_filepath can be:
       - str: a single root used for all families (original behavior)
@@ -110,7 +111,7 @@ if __name__ == "__main__":
     # Combine families across experiments
     roots_per_family = {
         1: [r"D:\Data\235", r"D:\Data\237"],
-        2: [r"D:\Data\112", r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"],
+        2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"], #r"D:\Data\112",
     }
     out_dir = fr"D:\data\model_checkpoints"
     os.makedirs(out_dir, exist_ok=True)
@@ -132,25 +133,38 @@ if __name__ == "__main__":
         check=True
     )
 
-    train_dataset = bird_data(train_fns, train_ids,specs_per_file=specs_per_file,transform=spec_to_tensor,conditional=False) # Conditional is false because we are not training with the arena info
+    train_dataset = bird_data(train_fns, train_ids,specs_per_file=specs_per_file,transform=spec_to_tensor,conditional=True,conditional_factor='mean_freq_bin1h',
+                              min_freq=500,
+                              max_freq=62500,
+                              num_freq_bins=128
+                              )
     # train_dataset = bird_data(train_fns,train_ids,specs_per_file=specs_per_file,transform=lambda x: torch.from_numpy(x).to(torch.float32).unsqueeze(0), conditional=False)      # *GILY*: this is Mile's version, but I can't use lambda on multiprocessing in Windows
 
     ### Unfortunately, transform has to be a little weird because of how I saved the spectrograms. This performs these operations on each spectrogram before returning them
     ### Conditional determines if we want to condition our model on other variables (fm, entropy, syllable length, etc)
 
-    test_dataset = bird_data(test_fns, test_ids,specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=False)
+    test_dataset = bird_data(test_fns, test_ids,specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=True,conditional_factor='mean_freq_bin1h',
+                             min_freq=500,
+                             max_freq=62500,
+                             num_freq_bins=128
+                             )
     # test_dataset = bird_data(test_fns,test_ids,specs_per_file=specs_per_file,transform=lambda x: torch.from_numpy(x).to(torch.float32).unsqueeze(0), conditional=False)      # *GILY*: this is Mile's version, but I can't use lambda on multiprocessing in Windows
 
-    train_loader = DataLoader(train_dataset,batch_size=64,num_workers=n_workers,shuffle=True)
-    test_loader = DataLoader(test_dataset,batch_size=64,num_workers=n_workers,shuffle=False)
+    COND = True  # you are using conditionals
+    BATCH = 1 if COND else 64
+    c_dimension= 3 if COND else 1
 
     use_cuda = torch.cuda.is_available()
-    pin = True if use_cuda else False
+    pin = bool(use_cuda)
 
-    from vocalizations.qmc_deep_gen.models.sampling import gen_fib_basis,gen_korobov_basis
-    from vocalizations.qmc_deep_gen.models.utils import get_decoder_arch
-    from vocalizations.qmc_deep_gen.models.qmc_base import QMCLVM
-    import torch
+    train_loader = DataLoader(train_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=True, pin_memory=pin) #64
+    test_loader = DataLoader(test_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=False, pin_memory=pin) #64
+
+
+
+    from models.sampling import gen_fib_basis,gen_korobov_basis
+    from models.utils import get_decoder_arch
+    from models.qmc_base import QMCLVM
 
     latent_dim=2 # sets our latent dimension
     ### If we use two dimensions, we should use gen_fib_basis for our grid over the latent space
@@ -163,25 +177,48 @@ if __name__ == "__main__":
 
     dataset = 'gerbil_ava' # used for getting a pre-selected decoder architecture
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu') # use gpu if possible
+    # make sure I'm on gpu
+    import torch
 
-    decoder = get_decoder_arch(dataset_name=dataset,latent_dim=latent_dim) # get_decoder_arch has a set of fixed architectures --
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[DEVICE] Using: {device}")
+    if device.type == "cuda":
+        print(f"[DEVICE] GPU: {torch.cuda.get_device_name(0)}")
+        print(f"[DEVICE] CUDA capability: {torch.cuda.get_device_capability(0)}")
+        print(f"[DEVICE] cuDNN enabled: {torch.backends.cudnn.enabled}")
+
+    decoder = get_decoder_arch(dataset_name=dataset,latent_dim=latent_dim,arch="conditional_qmc",cond_dim=c_dimension) # get_decoder_arch has a set of fixed architectures --
     ### if you want to play around with your own, you can make one using nn.Sequential (strings together layers). That's all that the
     ### decoders are -- nn.Sequential instances
     #%%
-    from vocalizations.qmc_deep_gen.train.losses import binary_evidence,binary_lp,gaussian_evidence,gaussian_lp
+    from train.losses import binary_evidence,binary_lp,gaussian_evidence,gaussian_lp
     model = QMCLVM(latent_dim=latent_dim,device=device,decoder=decoder)
+
+
+    ########## test
+    first_linear = None
+    for m in model.decoder.modules():
+        if isinstance(m, nn.Linear):
+            first_linear = m
+            break
+
+    print("[CHECK] decoder[0]:", first_linear)  # will print: Linear(in_features=7, out_features=64, bias=True)
+    print("[CHECK] in_features:", first_linear.in_features)
+
+    ####################
+
 
     ## binary evidence
     qmc_loss_func = binary_evidence # I used this for training models, but we can also use gaussian (what the VAE uses)
     qmc_lp = binary_lp
 
-    from vocalizations.qmc_deep_gen.train.train import train_loop
-    nEpochs=10
+    from train.train import train_loop
+    nEpochs=2
 
     #### to speed up training, you can decrease grid size (decrease m) at the expense of model performance,
     #### or increase batch size
     model, opt, losses = train_loop(
         model, train_loader, latent_grid.to(device), qmc_loss_func,
-        nEpochs=nEpochs, verbose=True, conditional=False,
+        nEpochs=nEpochs, verbose=True, conditional=True,
         out_dir=out_dir
     )

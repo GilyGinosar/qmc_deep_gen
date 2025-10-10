@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path  # add near your imports
+from torch.utils.data import Dataset, Subset
 
 # ==== project imports (same stack you used for training) ====
 from data.bird_data import load_gerbils, bird_data
@@ -34,18 +35,41 @@ DATA_ROOT = {
 TEST_FAMILY_IDS = [2]
 CKPT_DIR        = fr"D:\Data\model_checkpoints"    # where train_loop saved checkpoints
 BATCH_SIZE      = 64
-NUM_WORKERS     = 0                                # Windows-safe
+NUM_WORKERS     = 2                                # Windows-safe
 LATENT_DIM      = 2
 M_FIB           = 15                               # same latent grid density
 SPECS_PER_FILE  = 100
 TEST_SIZE       = 0.20
 SPLIT_SEED      = 92
+# --- conditional binning params (match training) ---
+MIN_FREQ_HZ    = 500
+MAX_FREQ_HZ    = 62500
+NUM_FREQ_BINS  = 128
+COND_FACTOR    = "mean_freq_bin1h"   # the one-hot(3) we added in bird_data
+COND_DIM       = 3                   # one-hot length
+
 
 out_dir_fig = r"D:\Data\Figs"
 os.makedirs(out_dir_fig, exist_ok=True)
 
 
 # -----------------------------------------------
+
+# takes a dataset that yields (spec, c, label) and exposes (spec, label) so embed_data can stay unchanged
+from torch.utils.data import Dataset
+
+class _PlainView(Dataset):
+    """Wrap a conditional dataset (spec, c, label) to expose (spec, label)."""
+    def __init__(self, base_ds, indices):
+        self.base = base_ds
+        self.idxs = indices
+    def __len__(self):
+        return len(self.idxs)
+    def __getitem__(self, i):
+        spec, c, label = self.base[self.idxs[i]]
+        return spec, label  # drop c so embed_data sees the same shape as before
+
+
 def spec_to_tensor(x: np.ndarray) -> torch.Tensor:
     # same transform you used in training (module-level so workers could import, if needed)
     return torch.from_numpy(x).to(torch.float32).unsqueeze(0)
@@ -151,34 +175,72 @@ def build_loaders():
     )
 
     # gets one sample at a time by index via __getitem__ and knows how many samples exist via __len__, each item is (spec,family_id) or (spec,c,family_id)
-    test_ds = bird_data(test_fns, test_ids, specs_per_file=specs_per_file,
-                        transform=spec_to_tensor, conditional=False) # conditional=False--> no arena info
-    train_ds = bird_data(train_fns, train_ids, specs_per_file=specs_per_file,
-                         transform=spec_to_tensor, conditional=False) # conditional=False--> no arena info
+    test_ds_cond = bird_data(test_fns, test_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=True, conditional_factor=COND_FACTOR)
+    train_ds_cond = bird_data(train_fns, train_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=True, conditional_factor=COND_FACTOR)
 
+    test_ds = bird_data(test_fns, test_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=False)
+    train_ds = bird_data(train_fns, train_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=False)
 
     # wraps the dataset to give mini-batches, splits by batch_size
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-    )
+    train_loader_cond = DataLoader(train_ds_cond, batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader_cond  = DataLoader(test_ds_cond,  batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-    )
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
 
-    return train_loader, test_loader, train_fns, test_fns
+    # ---- which example is from which bin? ----
+    bin_to_idxs = {0: [], 1: [], 2: []}
+    tmp = DataLoader(test_ds_cond, batch_size=128, shuffle=False, num_workers=0) # iterates the dataset one after the other
+    idx = 0
+    for _, c, _ in tmp:
+        # c: [B,3] one-hot; get bin ids
+        bins = c.argmax(dim=1).tolist() # the bin of each sample [2, 2, 1, 0, 2, ...]
+        for b in bins:
+            bin_to_idxs[b].append(idx) # vecotr of sample indices for each bin
+            idx += 1
+            # bin_to_idxs = {
+            #   0: [0, 7, 11, ...],
+            #   1: [2, 5, 8, ...],
+            #   2: [1, 3, 4, 6, 9, ...],
+            # }
+
+    # Per-bin PLAIN views (drop c), so embed_data sees (data,label)
+    test_bin_views = {
+        b: _PlainView(test_ds_cond, bin_to_idxs[b]) for b in (0, 1, 2)
+    }
+    test_bin_loaders = { # build dataLoader per bin
+        b: DataLoader(test_bin_views[b], batch_size=BATCH_SIZE, shuffle=False,
+                      num_workers=NUM_WORKERS, pin_memory=True)
+        for b in (0, 1, 2)
+    }
+
+    # ---- TRAIN: which example is from which bin? (mirror of your TEST block) ----
+    train_bin_to_idxs = {0: [], 1: [], 2: []}
+    tmp_tr = DataLoader(train_ds_cond, batch_size=128, shuffle=False, num_workers=0)
+    idx = 0
+    for _, c, _ in tmp_tr:
+        bins = c.argmax(dim=1).tolist()
+        for b in bins:
+            train_bin_to_idxs[b].append(idx)
+            idx += 1
+
+    train_bin_views = {b: _PlainView(train_ds_cond, train_bin_to_idxs[b]) for b in (0, 1, 2)}
+    train_bin_loaders = {
+        b: DataLoader(train_bin_views[b], batch_size=BATCH_SIZE, shuffle=False,
+                      num_workers=NUM_WORKERS, pin_memory=True)
+        for b in (0, 1, 2)
+    }
+
+    return (train_loader_cond, test_loader_cond,
+            train_loader, test_loader,
+            test_bin_loaders, train_bin_loaders,  # <— add this
+            train_fns, test_fns)
+
 
 
 def rebuild_model(device):
-    decoder = get_decoder_arch(dataset_name="gerbil_ava", latent_dim=LATENT_DIM)
+    decoder = get_decoder_arch(dataset_name="gerbil_ava", latent_dim=LATENT_DIM,
+                               arch="conditional_qmc",cond_dim=COND_DIM) # added for conditionals
     model = QMCLVM(latent_dim=LATENT_DIM, device=device, decoder=decoder)
     return model
 
@@ -206,7 +268,9 @@ def main():
     qmc_lp        = binary_lp
 
     # 2) dataset/loader (same split params as training)
-    train_loader, test_loader,train_fns, test_fns = build_loaders()
+    (train_loader_cond, test_loader_cond,
+     train_loader, test_loader,
+     test_bin_loaders, train_fns, test_fns) = build_loaders()
 
 
     # 3) model + checkpoint
@@ -223,10 +287,10 @@ def main():
     with torch.no_grad():
         test_losses = test_epoch(
             model,
-            test_loader,
+            test_loader_cond,
             latent_grid.to(device),
             qmc_loss_func,
-            conditional=False,
+            conditional=True,
         )
 
     # 5) save eval artifacts
@@ -251,36 +315,81 @@ def main():
     qmc_train_plot(train_losses, test_losses, save_fn=os.path.join(out_dir_fig, "train_vs_test.png"), show=True)
 
     # 6b) decoder grid visualization
+    class CondWrapped(nn.Module):
+        def __init__(self, base_model: nn.Module, c_onehot: torch.Tensor):
+            super().__init__()
+            self.base = base_model
+            self.c = c_onehot.to(base_model.device).to(torch.float32)
+            self.device = base_model.device  # so your plot code still works
+
+        def forward(self, z, mod=False, random=False):
+            # delegate to the real model, always passing the fixed c
+            return self.base(z, mod=mod, random=random, c=self.c)
+
+    onehots = {
+        0: torch.tensor([[1., 0., 0.]]),
+        1: torch.tensor([[0., 1., 0.]]),
+        2: torch.tensor([[0., 0., 1.]]),
+    }
+
+    # Wrap the model per bin
+    model_b0 = CondWrapped(model, onehots[0])
+    model_b1 = CondWrapped(model, onehots[1])
+    model_b2 = CondWrapped(model, onehots[2])
+
+    # Now call your unchanged model_grid_plot three times
     with torch.no_grad():
-         model_grid_plot(model, n_samples_dim=20, origin="lower", cm="inferno",show=False,
-                        fn=os.path.join(out_dir_fig, "decoder_grid.png"),)  # may take a bit
+        model_grid_plot(model_b0, n_samples_dim=20, origin="lower", cm="inferno",
+                        show=False, fn=os.path.join(out_dir_fig, "decoder_grid_bin0.png"))
 
+        model_grid_plot(model_b1, n_samples_dim=20, origin="lower", cm="inferno",
+                        show=False, fn=os.path.join(out_dir_fig, "decoder_grid_bin1.png"))
 
-    # 6c) latent embeddings scatter
-    # Test data embedding
-    test_embeddings, test_labels = model.embed_data(
-        latent_grid.to(device),
-        test_loader,
-        qmc_lp,
-        embed_type="rqmc",
-        n_samples=5,
-    )
+        model_grid_plot(model_b2, n_samples_dim=20, origin="lower", cm="inferno",
+                        show=False, fn=os.path.join(out_dir_fig, "decoder_grid_bin2.png"))
 
-    # Train data embedding
-    train_embeddings, train_labels = model.embed_data(
-        latent_grid.to(device),
-        train_loader,
-        qmc_lp,
-        embed_type="rqmc",
-        n_samples=5,
-    )
+    # embedding per bin
+    onehots = {
+        0: torch.tensor([[1., 0., 0.]], device=device),
+        1: torch.tensor([[0., 1., 0.]], device=device),
+        2: torch.tensor([[0., 0., 1.]], device=device),
+    }
+
+    for b in (0, 1, 2):
+        emb, lab = model.embed_data(
+            latent_grid.to(device),
+            test_bin_loaders[b],  # (spec, label) only
+            binary_lp,
+            embed_type="rqmc",
+            n_samples=5,
+            c=onehots[b],  # <- key: embed on the correct conditional slice
+        )
+    # ----- Non-conditional ------
+    # # 6c) latent embeddings scatter
+    # # Test data embedding
+    # test_embeddings, test_labels = model.embed_data(
+    #     latent_grid.to(device),
+    #     test_loader,
+    #     qmc_lp,
+    #     embed_type="rqmc",
+    #     n_samples=5,
+    # )
+    #
+    # # Train data embedding
+    # train_embeddings, train_labels = model.embed_data(
+    #     latent_grid.to(device),
+    #     train_loader,
+    #     qmc_lp,
+    #     embed_type="rqmc",
+    #     n_samples=5,
+    # )
 
 
     # =========================
     # Plot — all families together
     # =========================
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
+   # fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
 
     # Test
     # ax = axes[0]
@@ -349,178 +458,178 @@ def main():
     # =========================
     # Plot - train/test seperately
     # =========================
-    import math
-
-    def _grid_nrows_ncols(n, max_cols=4):
-        cols = min(n, max_cols)
-        rows = math.ceil(n / cols)
-        return rows, cols
-
-    families_present = sorted(np.unique(np.concatenate([train_labels, test_labels])))
-    n = len(families_present)
-    rows, cols = _grid_nrows_ncols(n, max_cols=4)
-
-    # ---------- TRAIN panels ----------
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), sharex=True, sharey=True)
-    axes = np.atleast_2d(axes)
-
-    for idx, fam in enumerate(families_present):
-        r, c = divmod(idx, cols)
-        ax = axes[r, c]
-        m_tr = (train_labels == fam)
-        ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-                   s=3, marker=".", c="C0", alpha=0.6, linewidths=0)
-        ax = format_plot_axis(
-            ax, xlim=(0, 1), ylim=(0, 1),
-            xlabel="Latent dim 1", ylabel="Latent dim 2",
-            title=f"Train — family {int(fam)}"
-        )
-
-    # hide any unused axes
-    for j in range(n, rows * cols):
-        r, c = divmod(j, cols)
-        axes[r, c].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir_fig, "embeddings_train_panels_by_family.png"),
-                dpi=300, bbox_inches="tight")
-    plt.show();
-    plt.close(fig)
-
-    # ---------- TEST panels ----------
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), sharex=True, sharey=True)
-    axes = np.atleast_2d(axes)
-
-    for idx, fam in enumerate(families_present):
-        r, c = divmod(idx, cols)
-        ax = axes[r, c]
-        m_te = (test_labels == fam)
-        ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-                   s=3, marker=".", c="C0", alpha=0.6, linewidths=0)
-        ax = format_plot_axis(
-            ax, xlim=(0, 1), ylim=(0, 1),
-            xlabel="Latent dim 1", ylabel="Latent dim 2",
-            title=f"Test — family {int(fam)}"
-        )
-
-    for j in range(n, rows * cols):
-        r, c = divmod(j, cols)
-        axes[r, c].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir_fig, "embeddings_test_panels_by_family.png"),
-                dpi=300, bbox_inches="tight")
-    plt.show();
-    plt.close(fig)
-
-    # =========================
-    # Plot - By location
-    # =========================
-    # Read locations from hdf5 files
-    def _read_locations_for_file(h5_path):
-        with h5py.File(h5_path, 'r') as f:
-            locs = f['locations'][:]  # bytes array length = number of specs in this file
-        # decode bytes -> str
-        return np.array([x.decode('ASCII') for x in locs], dtype=object)
-
-    def build_locations_vector(file_list):
-        """
-        Returns a 1D array of strings (arena_1/arena_2/underground) aligned
-        with the order bird_data/test_loader iterate (file-major, no shuffle).
-        """
-        out = []
-        for p in file_list:
-            out.extend(_read_locations_for_file(p))
-        return np.array(out, dtype=object)
-
-    # locations
-    train_locs = build_locations_vector(train_fns)  # shape = len(train_embeddings)
-    test_locs = build_locations_vector(test_fns)  # shape = len(test_embeddings)
-
+    # import math
     #
-    # plot - one family at one location (train vs test panels)
-    def plot_family_location(fam, loc_name,
-                             train_embeddings, train_labels, train_locs,
-                             test_embeddings, test_labels, test_locs,
-                             out_dir_fig):
-        m_tr = (train_labels == fam) & (train_locs == loc_name)
-        m_te = (test_labels == fam) & (test_locs == loc_name)
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
-
-        # Test
-        ax = axes[0]
-        ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-                   s=3, marker=".", alpha=0.7, c="C0")
-        ax = format_plot_axis(
-            ax, xlim=(0, 1), ylim=(0, 1),
-            xlabel="Latent dim 1", ylabel="Latent dim 2",
-            title=f"Test — family {int(fam)}, {loc_name}"
-        )
-
-        # Train
-        ax = axes[1]
-        ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-                   s=3, marker=".", alpha=0.7, c="C0")
-        ax = format_plot_axis(
-            ax, xlim=(0, 1), ylim=(0, 1),
-            xlabel="Latent dim 1", ylabel="Latent dim 2",
-            title=f"Train — family {int(fam)}, {loc_name}"
-        )
-
-        plt.tight_layout()
-        fn = os.path.join(out_dir_fig, f"embeddings_family{int(fam)}_{loc_name}_train_vs_test.png")
-        plt.savefig(fn, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-    for fam in sorted(np.unique(np.concatenate([train_labels, test_labels]))):
-        for loc in ["arena_1", "arena_2", "underground"]:
-            plot_family_location(fam, loc,
-                                     train_embeddings, train_labels, train_locs,
-                                     test_embeddings, test_labels, test_locs,
-                                     out_dir_fig)
-
-    # plot - “all families pooled” but filtered to a single location
-    def plot_all_families_at_location(loc_name,
-                                      train_embeddings, train_locs,
-                                      test_embeddings, test_locs,
-                                      out_dir_fig):
-        m_tr = (train_locs == loc_name)
-        m_te = (test_locs == loc_name)
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
-
-        # Test
-        ax = axes[0]
-        ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-                   s=3, marker=".", alpha=0.7, c="C0")
-        ax = format_plot_axis(
-            ax, xlim=(0, 1), ylim=(0, 1),
-            xlabel="Latent dim 1", ylabel="Latent dim 2",
-            title=f"Test — all families @ {loc_name}"
-        )
-
-        # Train
-        ax = axes[1]
-        ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-                   s=3, marker=".", alpha=0.7, c="C0")
-        ax = format_plot_axis(
-            ax, xlim=(0, 1), ylim=(0, 1),
-            xlabel="Latent dim 1", ylabel="Latent dim 2",
-            title=f"Train — all families @ {loc_name}"
-        )
-
-        plt.tight_layout()
-        fn = os.path.join(out_dir_fig, f"embeddings_allfamilies_{loc_name}_train_vs_test.png")
-        plt.savefig(fn, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-    for loc in ["arena_1", "arena_2", "underground"]:
-        plot_all_families_at_location(loc, train_embeddings, train_locs,
-                                      test_embeddings, test_locs,
-                                      out_dir_fig)
-
-    # =========================
+    # def _grid_nrows_ncols(n, max_cols=4):
+    #     cols = min(n, max_cols)
+    #     rows = math.ceil(n / cols)
+    #     return rows, cols
+    #
+    # families_present = sorted(np.unique(np.concatenate([train_labels, test_labels])))
+    # n = len(families_present)
+    # rows, cols = _grid_nrows_ncols(n, max_cols=4)
+    #
+    # # ---------- TRAIN panels ----------
+    # fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), sharex=True, sharey=True)
+    # axes = np.atleast_2d(axes)
+    #
+    # for idx, fam in enumerate(families_present):
+    #     r, c = divmod(idx, cols)
+    #     ax = axes[r, c]
+    #     m_tr = (train_labels == fam)
+    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
+    #                s=3, marker=".", c="C0", alpha=0.6, linewidths=0)
+    #     ax = format_plot_axis(
+    #         ax, xlim=(0, 1), ylim=(0, 1),
+    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #         title=f"Train — family {int(fam)}"
+    #     )
+    #
+    # # hide any unused axes
+    # for j in range(n, rows * cols):
+    #     r, c = divmod(j, cols)
+    #     axes[r, c].axis("off")
+    #
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(out_dir_fig, "embeddings_train_panels_by_family.png"),
+    #             dpi=300, bbox_inches="tight")
+    # plt.show();
+    # plt.close(fig)
+    #
+    # # ---------- TEST panels ----------
+    # fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), sharex=True, sharey=True)
+    # axes = np.atleast_2d(axes)
+    #
+    # for idx, fam in enumerate(families_present):
+    #     r, c = divmod(idx, cols)
+    #     ax = axes[r, c]
+    #     m_te = (test_labels == fam)
+    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
+    #                s=3, marker=".", c="C0", alpha=0.6, linewidths=0)
+    #     ax = format_plot_axis(
+    #         ax, xlim=(0, 1), ylim=(0, 1),
+    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #         title=f"Test — family {int(fam)}"
+    #     )
+    #
+    # for j in range(n, rows * cols):
+    #     r, c = divmod(j, cols)
+    #     axes[r, c].axis("off")
+    #
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(out_dir_fig, "embeddings_test_panels_by_family.png"),
+    #             dpi=300, bbox_inches="tight")
+    # plt.show();
+    # plt.close(fig)
+    #
+    # # =========================
+    # # Plot - By location
+    # # =========================
+    # # Read locations from hdf5 files
+    # def _read_locations_for_file(h5_path):
+    #     with h5py.File(h5_path, 'r') as f:
+    #         locs = f['locations'][:]  # bytes array length = number of specs in this file
+    #     # decode bytes -> str
+    #     return np.array([x.decode('ASCII') for x in locs], dtype=object)
+    #
+    # def build_locations_vector(file_list):
+    #     """
+    #     Returns a 1D array of strings (arena_1/arena_2/underground) aligned
+    #     with the order bird_data/test_loader iterate (file-major, no shuffle).
+    #     """
+    #     out = []
+    #     for p in file_list:
+    #         out.extend(_read_locations_for_file(p))
+    #     return np.array(out, dtype=object)
+    #
+    # # locations
+    # train_locs = build_locations_vector(train_fns)  # shape = len(train_embeddings)
+    # test_locs = build_locations_vector(test_fns)  # shape = len(test_embeddings)
+    #
+    # #
+    # # plot - one family at one location (train vs test panels)
+    # def plot_family_location(fam, loc_name,
+    #                          train_embeddings, train_labels, train_locs,
+    #                          test_embeddings, test_labels, test_locs,
+    #                          out_dir_fig):
+    #     m_tr = (train_labels == fam) & (train_locs == loc_name)
+    #     m_te = (test_labels == fam) & (test_locs == loc_name)
+    #
+    #     fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
+    #
+    #     # Test
+    #     ax = axes[0]
+    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
+    #                s=3, marker=".", alpha=0.7, c="C0")
+    #     ax = format_plot_axis(
+    #         ax, xlim=(0, 1), ylim=(0, 1),
+    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #         title=f"Test — family {int(fam)}, {loc_name}"
+    #     )
+    #
+    #     # Train
+    #     ax = axes[1]
+    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
+    #                s=3, marker=".", alpha=0.7, c="C0")
+    #     ax = format_plot_axis(
+    #         ax, xlim=(0, 1), ylim=(0, 1),
+    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #         title=f"Train — family {int(fam)}, {loc_name}"
+    #     )
+    #
+    #     plt.tight_layout()
+    #     fn = os.path.join(out_dir_fig, f"embeddings_family{int(fam)}_{loc_name}_train_vs_test.png")
+    #     plt.savefig(fn, dpi=300, bbox_inches="tight")
+    #     plt.close(fig)
+    #
+    # for fam in sorted(np.unique(np.concatenate([train_labels, test_labels]))):
+    #     for loc in ["arena_1", "arena_2", "underground"]:
+    #         plot_family_location(fam, loc,
+    #                                  train_embeddings, train_labels, train_locs,
+    #                                  test_embeddings, test_labels, test_locs,
+    #                                  out_dir_fig)
+    #
+    # # plot - “all families pooled” but filtered to a single location
+    # def plot_all_families_at_location(loc_name,
+    #                                   train_embeddings, train_locs,
+    #                                   test_embeddings, test_locs,
+    #                                   out_dir_fig):
+    #     m_tr = (train_locs == loc_name)
+    #     m_te = (test_locs == loc_name)
+    #
+    #     fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
+    #
+    #     # Test
+    #     ax = axes[0]
+    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
+    #                s=3, marker=".", alpha=0.7, c="C0")
+    #     ax = format_plot_axis(
+    #         ax, xlim=(0, 1), ylim=(0, 1),
+    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #         title=f"Test — all families @ {loc_name}"
+    #     )
+    #
+    #     # Train
+    #     ax = axes[1]
+    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
+    #                s=3, marker=".", alpha=0.7, c="C0")
+    #     ax = format_plot_axis(
+    #         ax, xlim=(0, 1), ylim=(0, 1),
+    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #         title=f"Train — all families @ {loc_name}"
+    #     )
+    #
+    #     plt.tight_layout()
+    #     fn = os.path.join(out_dir_fig, f"embeddings_allfamilies_{loc_name}_train_vs_test.png")
+    #     plt.savefig(fn, dpi=300, bbox_inches="tight")
+    #     plt.close(fig)
+    #
+    # for loc in ["arena_1", "arena_2", "underground"]:
+    #     plot_all_families_at_location(loc, train_embeddings, train_locs,
+    #                                   test_embeddings, test_locs,
+    #                                   out_dir_fig)
+    #
+    # # =========================
     # Plot — embeddings over the decoded grid background
     # (place this AFTER train/test embeddings are computed)
     # =========================

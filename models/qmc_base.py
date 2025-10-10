@@ -4,6 +4,9 @@ from tqdm import tqdm
 import numpy as np
 import string 
 
+import sys
+
+
 class FourierBasis(nn.Module):
 
     def __init__(self, num_dims=2, num_freqs=4, device=None):
@@ -89,14 +92,25 @@ class QMCLVM(nn.Module):
         """
         eval_grid should be a sequence of `z`s that uniformly tile the latent space,
         and should be n_grid_points x latent_dim
+        eval_grid: [n_grid_points, latent_dim] grid over latent space
         """
         
 
         r = self.shift_function(1, self.latent_dim, device=self.device) if random else torch.zeros((1,self.latent_dim),device=self.device)
         x = (r + eval_grid) % 1 if mod else r+eval_grid
+
         basis = self.basis(x)
-        if len(c) > 0:
-            basis = torch.cat([basis,c.repeat(basis.shape[0],1)],axis=-1)
+
+        # --- normalize shape of c to [1, cond_dim] and repeat to [K, cond_dim] ---
+        if isinstance(c, torch.Tensor) and c.numel() > 0:
+            c = c.to(basis.device, dtype=basis.dtype)
+            if c.dim() == 1:  # e.g., [3] -> [1,3]
+                c = c.unsqueeze(0)
+            # We expect exactly one condition row per forward call
+            assert c.shape[0] == 1, f"QMCLVM.forward expected c with shape [1,cond_dim], got {tuple(c.shape)}"
+            c_rep = c.repeat(basis.shape[0], 1)  # [K, cond_dim]
+            basis = torch.cat([basis, c_rep], dim=-1)
+
         return self.decoder(basis)
 
 

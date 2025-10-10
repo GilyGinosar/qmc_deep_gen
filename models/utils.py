@@ -4,13 +4,24 @@ import torch.nn as nn
 from models.qmc_base import TorusBasis
 from models.vae_base import Encoder
 
-def get_decoder_arch(dataset_name,latent_dim,arch='qmc',n_per_sample=5):
+def get_decoder_arch(dataset_name,latent_dim,arch='qmc',n_per_sample=5,cond_dim=0):
 
     decoder = torch.nn.Sequential()
+
+    # Without conditionals
+    # if arch == 'qmc':
+    #     latent_dim *= 2
+    # elif arch == 'conditional_qmc':
+    #     latent_dim = latent_dim*2 + 1
+
+    # Gily (for conditional)
     if arch == 'qmc':
-        latent_dim *= 2
+        in_dim = latent_dim * 2  # TorusBasis doubles features
     elif arch == 'conditional_qmc':
-        latent_dim = latent_dim*2 + 1
+        # if old code called without cond_dim, fall back to +1
+        in_dim = latent_dim * 2 + (cond_dim if cond_dim else 1)
+    else:
+        in_dim = latent_dim  # fallback (not used in your code paths)
     
     decoder.append(nn.Linear(latent_dim,2048))
 
@@ -106,7 +117,8 @@ def get_decoder_arch(dataset_name,latent_dim,arch='qmc',n_per_sample=5):
             nn.Sigmoid()]
         
     elif ('gerbil_ava' in dataset_name.lower()):
-        decoder = nn.Sequential(nn.Linear(latent_dim,64))
+        #decoder = nn.Sequential(nn.Linear(latent_dim,64)) #without conditionals
+        decoder = nn.Sequential(nn.Linear(in_dim,64)) #with conditionals
 
         layers = [nn.ReLU(),
                   nn.Linear(64,256),
