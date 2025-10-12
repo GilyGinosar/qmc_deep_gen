@@ -4,12 +4,18 @@ import os,glob
 import h5py
 from sklearn.model_selection import train_test_split
 import numpy as np
-from tqdm import tqdm 
+from tqdm import tqdm
+import torch
 
 # --- fixed spectrogram grid (matches your preprocessing) ---
 MIN_FREQ_HZ   = 500
 MAX_FREQ_HZ   = 62500
 NUM_FREQ_BINS = 128
+
+def spec_to_tensor(x: np.ndarray) -> torch.Tensor:
+    # x: (F, T) numpy array
+    return torch.from_numpy(np.asarray(x)).to(torch.float32).unsqueeze(0)  # -> (1, F, T)
+
 
 def load_segmented_sylls(bird_filepath,sylls,test_size=0.2,seed=92):
 
@@ -29,7 +35,7 @@ def load_segmented_sylls(bird_filepath,sylls,test_size=0.2,seed=92):
 
 class bird_data(Dataset):
 
-    def __init__(self,filenames,syll_ids,specs_per_file=20,transform=transforms.ToTensor(),
+    def __init__(self,filenames,syll_ids,specs_per_file=20,transform=spec_to_tensor,
                  conditional=False,conditional_factor='fm'):
 
 
@@ -39,13 +45,9 @@ class bird_data(Dataset):
         self.transform = transform
         self.conditional=conditional
         self.conditional_factor = conditional_factor
-
-        # NEW: precompute linear frequency axis + cut indices for 22k/29k
         self.freq_axis = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ),
                                      int(NUM_FREQ_BINS), dtype=np.float64)
-        self.k22 = int(np.argmin(np.abs(self.freq_axis - 22000.0)))
-        self.k29 = int(np.argmin(np.abs(self.freq_axis - 29000.0)))
-
+        self.edges_hz = (22_000.0, 27_000.0)  # same cutpoints you used before
 
     def __len__(self):
         return len(self.filenames) * self.specs_per_file
@@ -76,15 +78,21 @@ class bird_data(Dataset):
 
                 elif self.conditional_factor == 'mean_freq':
                     c = calc_mean_freq(spec)
-                elif self.conditional_factor == 'median_freq':
-                    c = calc_median_freq(spec)
-                elif self.conditional_factor == 'avg_freq_over_time':
-                    c = calc_avg_freq_over_time(spec)
+
 
                 # ---- NEW one-hot binning (Option A: uses self.k22/self.k29 precomputed in __init__) ----
-                elif self.conditional_factor == 'mean_freq_bin1h':
-                    spec_np = np.array(spec, copy=False)
-                    c = calc_mean_freq_bin1h(spec_np, self.freq_axis)  # returns (3,) float32
+                # elif self.conditional_factor == 'mean_freq_bin1h':
+                #     spec_np = np.array(spec, copy=False)
+                #     c = calc_mean_freq_bin1h(spec_np, self.freq_axis)  # returns (3,) float32
+                # elif self.conditional_factor == 'freq_bin1h':
+                #     # generic: choose estimator name via attribute or hardcode here
+                #     c = one_hot_bin1h(spec, self.freq_axis, estimator="median50", edges_hz=self.edges_hz)
+
+                elif self.conditional_factor == 'framecount':
+                    onehot, _ = framecount_mid_priority_bin(spec, self.freq_axis,
+                                                            edges_hz=self.edges_hz,
+                                                            use_ambiguous=False)
+                    c = onehot  # 1-hot np.float32
 
                 else:
                     raise NotImplementedError
@@ -208,82 +216,48 @@ def calc_mean_freq(spec: np.ndarray, freq_axis: np.ndarray | None = None) -> flo
         return 0.0
     return float((f * w_f).sum() / (denom + _EPS))
 
-def calc_median_freq(spec: np.ndarray, freq_axis: np.ndarray | None = None) -> float:
+
+
+
+
+def calc_energy_weighted_median_hz(spec: np.ndarray,
+                                   freq_axis: np.ndarray | None = None,
+                                   time_reduce: str = "median") -> float:
     """
-    Global energy-weighted *median* frequency:
-    the frequency where cumulative SUM over time+freq reaches 50%.
-    This mirrors calc_mean_freq’s 'global' viewpoint but uses the median (robust).
+    50% spectral roll-off (energy-weighted median), no low-frequency trimming.
+
+    Steps: time-aggregate to 1D spectrum (median/mean), normalize to weights,
+    take the smallest bin where CDF >= 0.5. Returns Hz (or bin index if freq_axis is None).
     """
     S = np.asarray(spec, dtype=np.float64)
     S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
 
     F, T = S.shape
-    f = _get_freq_axis(F, freq_axis)
+    # 1D spectrum across time
+    if time_reduce == "mean":
+        s = S.mean(axis=1)
+    else:
+        s = np.median(S, axis=1)  # robust default
 
-    w_f = S.sum(axis=1)                 # (F,)
-    total = w_f.sum()
+    w = np.clip(s, 0, None)
+    total = w.sum()
     if total <= _EPS:
-        return 0.0
+        # fallback: mid-band (in Hz if freq_axis is provided, else mid index)
+        if freq_axis is None:
+            return float((F - 1) / 2.0)
+        f = _get_freq_axis(F, freq_axis)
+        return float(f[len(f)//2])
 
-    cdf = np.cumsum(w_f) / (total + _EPS)
+    cdf = np.cumsum(w / (total + _EPS))
     idx = int(np.searchsorted(cdf, 0.5, side="left"))
     idx = min(max(idx, 0), F - 1)
+
+    if freq_axis is None:
+        return float(idx)
+    f = _get_freq_axis(F, freq_axis)
     return float(f[idx])
 
-def calc_avg_freq_over_time(spec: np.ndarray, freq_axis: np.ndarray | None = None) -> float:
-    """
-    Equal-time average of per-frame mean frequency.
-    For each time frame, normalize over frequency (like calc_ent),
-    compute the mean frequency of that frame, then average across all
-    non-empty frames with *equal* weight per frame.
-    """
-    S = np.asarray(spec, dtype=np.float64)
-    S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
 
-    F, T = S.shape
-    f = _get_freq_axis(F, freq_axis)
-
-    # per-frame totals and non-empty mask (same idea as calc_ent)
-    denom_t = S.sum(axis=0)                     # (T,)
-    non_empty = denom_t > _EPS
-
-    if not np.any(non_empty):
-        return 0.0
-
-    # per-frame probabilities over frequency, then per-frame mean frequency
-    # (compute only for non-empty frames to avoid divide-by-zero)
-    frame_means = []
-    for t in np.where(non_empty)[0]:
-        p_ft = S[:, t] / (denom_t[t] + _EPS)    # (F,)
-        frame_means.append(float((f * p_ft).sum()))
-
-    # equal-time average (uniform over non-empty frames)
-    return float(np.mean(frame_means))
-
-
-def _freq_bin_idx_22_29(f_hz: float) -> int:
-    """Return 0 if <22k, 1 if [22k,29k), 2 if >=29k."""
-    if f_hz < 22_000.0: return 0
-    if f_hz < 29_000.0: return 1
-    return 2
-
-def _one_hot(idx: int, n: int = 3) -> np.ndarray:
-    v = np.zeros((n,), dtype=np.float32)
-    if 0 <= idx < n:
-        v[idx] = 1.0
-    return v
-
-def calc_mean_freq_bin1h(spec: np.ndarray, freq_axis: np.ndarray) -> np.ndarray:
-    f = calc_mean_freq(spec, freq_axis=freq_axis)       # returns Hz
-    return _one_hot(_freq_bin_idx_22_29(float(f)), 3)
-
-def calc_median_freq_bin1h(spec: np.ndarray, freq_axis: np.ndarray) -> np.ndarray:
-    f = calc_median_freq(spec, freq_axis=freq_axis)     # returns Hz
-    return _one_hot(_freq_bin_idx_22_29(float(f)), 3)
-
-def calc_avg_freq_over_time_bin1h(spec: np.ndarray, freq_axis: np.ndarray) -> np.ndarray:
-    f = calc_avg_freq_over_time(spec, freq_axis=freq_axis)  # returns Hz
-    return _one_hot(_freq_bin_idx_22_29(float(f)), 3)
 
 def _mean_row_index(spec_np: np.ndarray) -> float:
     """
@@ -297,3 +271,167 @@ def _mean_row_index(spec_np: np.ndarray) -> float:
         return float(F - 1) / 2.0  # fallback: center
     idx = np.arange(F, dtype=np.float64)
     return float((w * idx).sum() / s)
+
+
+
+
+# ---------- per-frame robust frequency ----------
+def per_frame_rolloff_hz(spec_FT: np.ndarray,
+                         freq_axis_hz: np.ndarray,
+                         p: float = 0.50,
+                         noise_percentile: float = 5.0,
+                         min_frame_energy_ratio: float = 1e-4) -> np.ndarray:
+    """
+    For each time frame, compute p% roll-off frequency (Hz) after subtracting a
+    per-frequency noise floor. Frames with too little energy are NaN.
+    """
+    S = np.asarray(spec_FT, dtype=np.float64)
+    F, T = S.shape
+    f = np.asarray(freq_axis_hz, dtype=np.float64); assert f.shape[0] == F
+
+    # Per-frequency noise floor; subtract
+    noise_f = np.percentile(S, noise_percentile, axis=1, keepdims=True)  # (F,1)
+    X = np.maximum(S - noise_f, 0.0)
+
+    # Frame energy + valid mask
+    e_t = X.sum(axis=0) + 1e-12
+    med_e = np.median(e_t) + 1e-12
+    valid = e_t >= (min_frame_energy_ratio * med_e)
+
+    # Cumulative sums per frame
+    cum = np.cumsum(X, axis=0)        # (F,T)
+    tot = cum[-1, :] + 1e-12          # (T,)
+    thresh = p * tot
+
+    out = np.full((T,), np.nan, dtype=np.float64)
+    for t in range(T):
+        if not valid[t]: continue
+        k = int(np.searchsorted(cum[:, t], thresh[t], side="left"))
+        k = min(max(k, 0), F - 1)
+        out[t] = f[k]
+    return out
+
+# ---------- bin utils ----------
+def _one_hot(idx: int, n_classes: int) -> np.ndarray:
+    v = np.zeros((n_classes,), dtype=np.float32)
+    if 0 <= idx < n_classes: v[idx] = 1.0
+    return v
+
+
+def _bin_index_from_edges(val_hz: float,
+                          edges_hz: tuple[float, float]) -> int:
+    """
+    With two edges (e1,e2): 0 if f<e1, 1 if e1<=f<e2, 2 if f>=e2
+    """
+    e1, e2 = float(edges_hz[0]), float(edges_hz[1])
+    if val_hz < e1: return 0
+    if val_hz < e2: return 1
+    return 2
+
+# older version
+# def one_hot_bin1h(spec: np.ndarray,
+#                   freq_axis: np.ndarray,
+#                   estimator: str = "median50",
+#                   edges_hz: tuple[float, float] = (22_000.0, 25_000.0),
+#                   n_classes: int = 3) -> np.ndarray:
+#     """
+#     General 1-hot binning using any scalar frequency estimator.
+#
+#     estimator:
+#       - "median50"      -> calc_energy_weighted_median_hz
+#       - "mean"          -> calc_mean_freq
+#       - "median_global" -> calc_median_freq          (your existing global-median implementation)
+#       - "avg_over_time" -> calc_avg_freq_over_time   (your equal-time mean)
+#
+#     Returns: (n_classes,) float32 one-hot vector.
+#     """
+#     if estimator == "median50":
+#         f_hz = calc_energy_weighted_median_hz(spec, freq_axis=freq_axis)
+#     elif estimator == "mean":
+#         f_hz = calc_mean_freq(spec, freq_axis=freq_axis)
+#     else:
+#         raise ValueError(f"Unknown estimator '{estimator}'")
+#
+#     idx = _bin_index_from_edges(float(f_hz), edges_hz)
+#     return _one_hot(idx, n_classes).astype(np.float32)
+
+# counting frames
+def framecount_mid_priority_bin(spec_FT: np.ndarray,
+                                freq_axis_hz: np.ndarray,
+                                edges_hz: tuple[float, float] = (22_000.0, 27_000.0),
+                                p_rolloff: float = 0.50,
+                                noise_percentile: float = 5.0,
+                                min_frame_energy_ratio: float = 1e-4,
+                                min_valid_frames: int = 3,
+                                # MID priority threshold:
+                                mid_priority_frac: float = 0.25,    # “good amount” of mid frames
+                                # optional ambiguous bucket:
+                                use_ambiguous: bool = False,
+                                ambiguous_margin: float = 0.10,
+                                n_classes_if_ambiguous: int = 4):
+    """
+    Bin decision with MID priority:
+      1) If fraction of valid frames in MID >= mid_priority_frac -> MID (regardless of HIGH).
+      2) Else if frames ONLY in HIGH -> HIGH.
+      3) Else if LOW has the most frames -> LOW.
+      4) Else if use_ambiguous and all three are comparable -> AMBIGUOUS.
+      5) Else -> argmax among (LOW, MID, HIGH).
+
+    Returns: (onehot, info_dict)
+    """
+    # 1) per-frame robust frequency
+    fpf = per_frame_rolloff_hz(
+        spec_FT, freq_axis_hz,
+        p=p_rolloff,
+        noise_percentile=noise_percentile,
+        min_frame_energy_ratio=min_frame_energy_ratio,
+    )
+    good = np.isfinite(fpf)
+    n_valid = int(good.sum())
+
+    if n_valid < min_valid_frames:
+        if use_ambiguous:
+            return _one_hot(3, n_classes_if_ambiguous), {"valid_frames": n_valid, "counts": (0,0,0), "rule": "too_few_valid"}
+        return _one_hot(0, 3), {"valid_frames": n_valid, "counts": (0,0,0), "rule": "too_few_valid"}  # default to low
+
+    # 2) counts per bin
+    bins = np.array([_bin_index_from_edges(x, edges_hz) for x in fpf[good]], dtype=int)
+    counts = np.bincount(bins, minlength=3)
+    total = int(counts.sum())
+    fracs = counts / (total if total > 0 else 1)
+
+    low, mid, high = int(counts[0]), int(counts[1]), int(counts[2])
+    fL, fM, fH = float(fracs[0]), float(fracs[1]), float(fracs[2])
+
+    # ---- decision rules (ordered) ----
+
+    # (1) MID priority
+    if fM >= mid_priority_frac:
+        if use_ambiguous:
+            return _one_hot(1, n_classes_if_ambiguous), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "mid_priority"}
+        return _one_hot(1, 3), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "mid_priority"}
+
+    # (2) HIGH-only
+    if low == 0 and mid == 0 and high > 0:
+        if use_ambiguous:
+            return _one_hot(2, n_classes_if_ambiguous), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "only_high"}
+        return _one_hot(2, 3), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "only_high"}
+
+    # (3) LOW majority
+    if (low > mid) and (low >= high):
+        if use_ambiguous:
+            return _one_hot(0, n_classes_if_ambiguous), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "low_majority"}
+        return _one_hot(0, 3), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "low_majority"}
+
+    # (4) optional AMBIGUOUS: all comparable (likely noise)
+    if use_ambiguous:
+        spread = max(fL, fM, fH) - min(fL, fM, fH)
+        if spread <= ambiguous_margin:
+            return _one_hot(3, n_classes_if_ambiguous), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "ambiguous_all_comparable"}
+
+    # (5) fallback: argmax (ties → np.argmax order)
+    winner = int(np.argmax(counts))
+    if use_ambiguous:
+        return _one_hot(winner, n_classes_if_ambiguous), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "argmax"}
+    return _one_hot(winner, 3), {"valid_frames": n_valid, "counts": (low, mid, high), "rule": "argmax"}
+

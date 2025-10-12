@@ -2,38 +2,23 @@
 from data.bird_data import load_gerbils,bird_data
 from torch.utils.data import DataLoader
 import numpy as np
-import os
 import torch
 import torch.nn as nn
-
+import os, glob, h5py
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 
 # Gily - Becasue I'm using Windows, can't use Miles's lambdas
 def spec_to_tensor(x: np.ndarray) -> torch.Tensor:
     # x shape: H x W numpy array
     return torch.from_numpy(x).to(torch.float32).unsqueeze(0)
 
-# Gily - Because I'm combining same family over multiple experiments
-import os, glob, h5py
-import numpy as np
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-
 def load_gerbils_multi(gerbil_filepath, specs_per_file, families=[2],
                  test_size=0.2, seed=92, check=True):
     """
-    gerbil_filepath can be:
-      - str: a single root used for all families (original behavior)
-      - list[str]: multiple roots used for all families (each family searched in each root)
-      - dict[int, list[str]]: per-family roots, e.g.
-          {
             1: [r"D:\Data\235\alarms", r"D:\Data\237\alarms"],
             2: [r"D:\Data\112\alarms", r"D:\Data\115\alarms", r"D:\Data\116\alarms"]
-          }
-
-    Expected directory under each root:
-      <root>/processed-data/family{F}/*.hdf5
     """
-
     try:
         len(families)
     except Exception:
@@ -97,70 +82,50 @@ def load_gerbils_multi(gerbil_filepath, specs_per_file, families=[2],
 
 
 if __name__ == "__main__":
-    #data_path = fr"D:\Data\{exp}\alarms"
-    # data_path = fr"\\sanesstorage.cns.nyu.edu\archive\ginosar\Processed_data\Audio\{exp}" #'/mnt/home/mmartinez/ceph/data/gerbil/gily' # this directory contains .hdf5 files with spectrograms from your audio
+
     n_workers = max(os.cpu_count()-1,1) #len(os.sched_getaffinity(0))
     n_workers = 0
     print(n_workers)
 
-    #(train_fns,test_fns),(train_ids,test_ids),specs_per_file = load_gerbils(data_path,specs_per_file=100,families=[1,2],test_size=0.2,seed=92,check=True)
-    ### specs_per_file is how many spectrograms are in each .hdf5 file, families is the family number we're trying to load (I just set the data you sent to family 1),
-    ### test_size is the portion of the data that will remain unseen in training, seed is used to maintain reproducibility, check determines whether we check to see if
-    ### all files have 100 vocalization each
-
     # Combine families across experiments
     roots_per_family = {
         1: [r"D:\Data\235", r"D:\Data\237"],
-        2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"], #r"D:\Data\112",
+        #2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"], #r"D:\Data\112",
     }
     out_dir = fr"D:\data\model_checkpoints"
     os.makedirs(out_dir, exist_ok=True)
+    CF = "framecount"
 
-    # (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils(
-    #     gerbil_filepath=roots_per_family,  # dict: per-family roots
-    #     specs_per_file=100,
-    #     families=[1, 2],
-    #     test_size=0.2,
-    #     seed=92,
-    #     check=True
-    # )
-    (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils_multi(
-        gerbil_filepath=roots_per_family,  # dict: per-family roots
-        specs_per_file=100,
-        families=[1,2],
-        test_size=0.2,
-        seed=92,
-        check=True
-    )
 
-    train_dataset = bird_data(train_fns, train_ids,specs_per_file=specs_per_file,transform=spec_to_tensor,conditional=True,conditional_factor='mean_freq_bin1h',
-                              min_freq=500,
-                              max_freq=62500,
-                              num_freq_bins=128
-                              )
-    # train_dataset = bird_data(train_fns,train_ids,specs_per_file=specs_per_file,transform=lambda x: torch.from_numpy(x).to(torch.float32).unsqueeze(0), conditional=False)      # *GILY*: this is Mile's version, but I can't use lambda on multiprocessing in Windows
+    # ----- load files with spectrograms ------
+    ### specs_per_file is how many spectrograms are in each .hdf5 file, all files have 100 vocalization each, families is the family number we're trying to load,
+    ### test_size - portion of the data that will remain unseen in training, seed is used to maintain reproducibility, check determines whether we check to see if
+    (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils_multi(gerbil_filepath=roots_per_family, specs_per_file=100, families=[1], test_size=0.2, seed=92, check=True)
 
-    ### Unfortunately, transform has to be a little weird because of how I saved the spectrograms. This performs these operations on each spectrogram before returning them
-    ### Conditional determines if we want to condition our model on other variables (fm, entropy, syllable length, etc)
+    # ----- load datasets (train / test) : single samples -----
+    # Miles used: transform=lambda x: torch.from_numpy(x).to(torch.float32).unsqueeze(0),  but I can't use lambda on multiprocessing in Windows
+    # returns either (spec, c, syll_id) or (spec, syll_id)
+    train_dataset = bird_data(train_fns, train_ids,specs_per_file=specs_per_file,transform=spec_to_tensor,conditional=True,conditional_factor=CF)     # Unfortunately, transform has to be a little weird because of how I saved the spectrograms. This performs these operations on each spectrogram before returning them
+    test_dataset = bird_data(test_fns, test_ids,specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=True,conditional_factor=CF)
 
-    test_dataset = bird_data(test_fns, test_ids,specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=True,conditional_factor='mean_freq_bin1h',
-                             min_freq=500,
-                             max_freq=62500,
-                             num_freq_bins=128
-                             )
-    # test_dataset = bird_data(test_fns,test_ids,specs_per_file=specs_per_file,transform=lambda x: torch.from_numpy(x).to(torch.float32).unsqueeze(0), conditional=False)      # *GILY*: this is Mile's version, but I can't use lambda on multiprocessing in Windows
-
-    COND = True  # you are using conditionals
+    COND = True  #  using conditionals
     BATCH = 1 if COND else 64
     c_dimension= 3 if COND else 1
 
     use_cuda = torch.cuda.is_available()
-    pin = bool(use_cuda)
+    pin = bool(use_cuda) # speeds up GPU transfers
 
-    train_loader = DataLoader(train_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=True, pin_memory=pin) #64
-    test_loader = DataLoader(test_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=False, pin_memory=pin) #64
+    # ----- delivers mini-batches using dataset (of size batch_size), may shuffle sample order each epoch-----
+    train_loader = DataLoader(train_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=True, pin_memory=pin)
+    test_loader = DataLoader(test_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=False, pin_memory=pin)
 
-
+    # ----- DBG
+    from collections import Counter
+    cnt = Counter()
+    for _, c, _ in DataLoader(train_dataset, batch_size=256, shuffle=False, num_workers=0):
+        idx = c.argmax(dim=1).tolist()   # c is one-hot
+        cnt.update(idx)
+    print("[train class counts]", dict(cnt))
 
     from models.sampling import gen_fib_basis,gen_korobov_basis
     from models.utils import get_decoder_arch
@@ -180,7 +145,6 @@ if __name__ == "__main__":
     # make sure I'm on gpu
     import torch
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[DEVICE] Using: {device}")
     if device.type == "cuda":
         print(f"[DEVICE] GPU: {torch.cuda.get_device_name(0)}")
