@@ -6,11 +6,17 @@ from sklearn.model_selection import train_test_split
 import numpy as np
 from tqdm import tqdm
 import torch
+from gily_code.bin_specs_rule_based import classify_spectrogram_three_way
 
 # --- fixed spectrogram grid (matches your preprocessing) ---
 MIN_FREQ_HZ   = 500
 MAX_FREQ_HZ   = 62500
 NUM_FREQ_BINS = 128
+
+def _onehot3_from_label(label: str) -> torch.Tensor:
+    idx = {"low": 0, "alarm": 1, "high": 2}.get(label, 0)
+    return torch.nn.functional.one_hot(torch.tensor(idx), num_classes=3).to(torch.float32)
+
 
 def spec_to_tensor(x: np.ndarray) -> torch.Tensor:
     # x: (F, T) numpy array
@@ -47,7 +53,7 @@ class bird_data(Dataset):
         self.conditional_factor = conditional_factor
         self.freq_axis = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ),
                                      int(NUM_FREQ_BINS), dtype=np.float64)
-        self.edges_hz = (22_000.0, 27_000.0)  # same cutpoints you used before
+
 
     def __len__(self):
         return len(self.filenames) * self.specs_per_file
@@ -93,6 +99,26 @@ class bird_data(Dataset):
                                                             edges_hz=self.edges_hz,
                                                             use_ambiguous=False)
                     c = onehot  # 1-hot np.float32
+                elif self.conditional_factor == 'framecount_argmax':
+                    c = framecount_argmax_bin(spec, self.freq_axis, edges_hz=self.edges_hz)
+
+                elif self.conditional_factor == 'rule3_bands':
+                    # spec: (F, T) numpy-like
+                    S = np.asarray(spec, dtype=np.float64)
+                    F = S.shape[0]
+
+                    # Build a freq axis in **kHz** to match the classifier’s expectation.
+                    # Use your fixed grid, but adapt if F != NUM_FREQ_BINS just in case.
+                    f_hz = self.freq_axis
+                    if f_hz.shape[0] != F:
+                        f_hz = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ), F, dtype=np.float64)
+                    freqs_khz = f_hz / 1000.0
+
+                    # Run your rule-based classifier (already imported at top)
+                    label, _diag = classify_spectrogram_three_way(S, freqs_khz)
+
+                    # One-hot torch tensor [3]: low=0, alarm=1, high=2
+                    c = _onehot3_from_label(label)
 
                 else:
                     raise NotImplementedError
@@ -311,12 +337,66 @@ def per_frame_rolloff_hz(spec_FT: np.ndarray,
         out[t] = f[k]
     return out
 
-# ---------- bin utils ----------
-def _one_hot(idx: int, n_classes: int) -> np.ndarray:
+# ---------- argmax ----------
+# --- helpers (place near your other utils) ---
+_EPS = 1e-10
+
+def _one_hot(idx: int, n_classes: int = 3) -> np.ndarray:
     v = np.zeros((n_classes,), dtype=np.float32)
     if 0 <= idx < n_classes: v[idx] = 1.0
     return v
 
+def _band_indices(freq_axis_hz: np.ndarray, edges_hz: tuple[float, float]):
+    e1, e2 = float(edges_hz[0]), float(edges_hz[1])
+    f = np.asarray(freq_axis_hz, dtype=np.float64)
+    low_idx  = np.where(f < e1)[0]
+    mid_idx  = np.where((f >= e1) & (f < e2))[0]
+    high_idx = np.where(f >= e2)[0]
+    return low_idx, mid_idx, high_idx
+
+def framecount_argmax_bin(spec_FT: np.ndarray,
+                          freq_axis_hz: np.ndarray,
+                          edges_hz: tuple[float, float] = (22_000.0, 27_000.0),
+                          alpha_gate: float = 0.05,
+                          band_presence_frac: float = 0.25,
+                          n_classes: int = 3) -> np.ndarray:
+    """
+    Multi-label presence per frame, then ARGMAX across bands at the clip level.
+    Returns: (n_classes,) float32 one-hot
+    """
+    S = np.asarray(spec_FT, dtype=np.float64)
+    S = np.maximum(S, 0.0)
+    F, T = S.shape
+
+    e_t = S.sum(axis=0)
+    med = np.median(e_t) + 1e-12
+    keep = e_t >= (alpha_gate * med)
+
+    low_idx, mid_idx, high_idx = _band_indices(freq_axis_hz, edges_hz)
+
+    cL = cM = cH = 0
+    for t in range(T):
+        if not keep[t]:
+            continue
+        col = S[:, t]
+        E_low  = float(col[low_idx].sum())  if low_idx.size  else 0.0
+        E_mid  = float(col[mid_idx].sum())  if mid_idx.size  else 0.0
+        E_high = float(col[high_idx].sum()) if high_idx.size else 0.0
+        tot = E_low + E_mid + E_high
+        if tot <= 0.0:
+            continue
+        if (E_low  / tot) >= band_presence_frac:  cL += 1
+        if (E_mid  / tot) >= band_presence_frac:  cM += 1
+        if (E_high / tot) >= band_presence_frac:  cH += 1
+
+    counts = np.array([cL, cM, cH], dtype=int)
+    idx = int(np.argmax(counts))  # pure argmax
+    return _one_hot(idx, n_classes).astype(np.float32)
+
+
+
+
+# ---------- bin utils ----------
 
 def _bin_index_from_edges(val_hz: float,
                           edges_hz: tuple[float, float]) -> int:

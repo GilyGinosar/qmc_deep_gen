@@ -33,7 +33,7 @@ add_safe_globals([TorchVersion])  # allowlist just this class
 
 # --------- config ----------
 DATA_ROOT = {
-    1: [r"D:\Data\235", r"D:\Data\237"],
+    1: [r"D:\Data\235",r"D:\Data\237"],
     2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"],
 }
 TEST_FAMILY_IDS = [1,2]
@@ -50,7 +50,7 @@ SPLIT_SEED      = 92
 MIN_FREQ_HZ    = 500
 MAX_FREQ_HZ    = 62500
 NUM_FREQ_BINS  = 128
-COND_FACTOR    = "freq_bin1h"   # the one-hot(3) we added in bird_data
+COND_FACTOR    = "rule3_bands"   # the one-hot(3) we added in bird_data
 COND_DIM       = 3                   # one-hot length
 FREQ_AXIS_GLOBAL = np.linspace(MIN_FREQ_HZ, MAX_FREQ_HZ, NUM_FREQ_BINS, dtype=np.float64)
 
@@ -97,7 +97,7 @@ def strip_dataparallel_prefix(sd):
 
 
 # Gily's version - move this later outside
-def load_gerbils_multi(gerbil_filepath, specs_per_file, families=[2],
+def load_gerbils_multi(gerbil_filepath, specs_per_file, families=[1],
                  test_size=0.2, seed=92, check=True):
 
     try:
@@ -359,117 +359,232 @@ def main():
     # save the individual spectrograms with a y-axis in kHz from MIN_FREQ_HZ..MAX_FREQ_HZ,
     # draw a dashed line at the mean frequency, and create one summed spectrogram per bin.
 
-    from data.bird_data import calc_energy_weighted_median_hz
-    from data.bird_data import calc_mean_freq
+    # # from data.bird_data import calc_energy_weighted_median_hz
+    # from data.bird_data import calc_mean_freq
+    # from data.bird_data import per_frame_rolloff_hz, _bin_index_from_edges
+    # EDGES_HZ = (22_000.0, 27_000.0)  # match your dataset’s edges
     FREQ_AXIS = FREQ_AXIS_GLOBAL
+    #
+    # def _safe(text: str) -> str:
+    #     return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(text))
+    #
+    # # def _save_spec_png_linaxis(spec_2d: np.ndarray, out_png: str, mean_freq_hz: float,
+    # #                            y_min_hz: float, y_max_hz: float,
+    # #                            cmap="magma", dpi=180, figsize=(5.0, 4.0)):
+    # #     import matplotlib.pyplot as plt
+    # #     y0_khz, y1_khz = y_min_hz / 1000.0, y_max_hz / 1000.0
+    # #     extent = [0, spec_2d.shape[1], y0_khz, y1_khz]
+    # #
+    # #     vmin = np.percentile(spec_2d, 5)
+    # #     vmax = np.percentile(spec_2d, 95)
+    # #     if vmin == vmax:
+    # #         vmin, vmax = float(spec_2d.min()), float(spec_2d.max())
+    # #
+    # #     plt.figure(figsize=figsize, dpi=dpi)
+    # #     im = plt.imshow(
+    # #         spec_2d, origin="lower", aspect="auto", extent=extent,
+    # #         cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest"
+    # #     )
+    # #     plt.colorbar(im, pad=0.01, shrink=0.9)
+    # #     plt.axhline(mean_freq_hz / 1000.0, color="white", linestyle="--", linewidth=1.0, alpha=0.9)
+    # #     plt.xlabel("Time (frames)")
+    # #     plt.ylabel("Frequency (kHz)")
+    # #     plt.tight_layout()
+    # #     plt.savefig(out_png, bbox_inches="tight")
+    # #     plt.close()
+    # # ------------------ dump plugin ------------------
+    # # Save spectrograms grouped by bin, with per-frame rolloff overlay and SUM image.
+    #
+    # import os, numpy as np
+    # from scipy.ndimage import zoom
+    #
+    # def dump_specs_by_bin(
+    #         split_name: str,
+    #         bin_loaders: dict,  # {0: DataLoader, 1: DataLoader, 2: DataLoader}
+    #         out_root: str,
+    #         freq_axis_hz: np.ndarray,  # e.g., np.linspace(MIN_FREQ_HZ, MAX_FREQ_HZ, NUM_FREQ_BINS)
+    #         edges_hz: tuple[float, float] = (22_000.0, 27_000.0),
+    #         *,
+    #         per_item_normalize: bool = True,  # normalize each spec before adding to SUM
+    #         target_sum_shape: tuple[int, int] | None = None,  # (F,T) to force SUM size
+    #         # per-frame rolloff params:
+    #         p_rolloff: float = 0.50,
+    #         noise_percentile: float = 5.0,
+    #         min_frame_energy_ratio: float = 1e-4,
+    #         # MID-priority rule:
+    #         mid_priority_frac: float = 0.25,
+    #         # visuals:
+    #         cmap: str = "magma", dpi_ind: int = 180, dpi_sum: int = 200,
+    # ):
+    #     """
+    #     Writes PNGs into {out_root}/bin_{b}/ for b in {0,1,2}.
+    #     Each individual PNG shows the spectrogram, dashed edges at edges_hz,
+    #     a per-frame rolloff trace, and a subtitle with counts/fractions/decision.
+    #     Also writes a SUM_spectrogram.png (+ .npy) per bin.
+    #     """
+    #     # lazy imports from your bird_data
+    #     from data.bird_data import per_frame_rolloff_hz, _bin_index_from_edges
+    #
+    #     os.makedirs(out_root, exist_ok=True)
+    #     y_min_hz = float(freq_axis_hz.min())
+    #     y_max_hz = float(freq_axis_hz.max())
+    #
+    #     def _safe(text: str) -> str:
+    #         return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(text))
+    #
+    #     def _resize_to(arr: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    #         F0, T0 = arr.shape
+    #         Ft, Tt = target_shape
+    #         if (F0, T0) == (Ft, Tt):
+    #             return arr
+    #         return zoom(arr, (Ft / max(F0, 1), Tt / max(T0, 1)), order=1)
+    #
+    #     def _save_spec_png_linaxis(
+    #             spec_2d: np.ndarray,
+    #             out_png: str,
+    #             *,
+    #             fpf_hz: np.ndarray | None = None,  # per-frame rolloff
+    #             edges_hz: tuple[float, float] | None = None,
+    #             title: str | None = None,
+    #             subtitle: str | None = None,
+    #             cmap: str = "magma",
+    #             dpi: int = 180,
+    #             figsize: tuple[float, float] = (5.8, 4.4),
+    #     ):
+    #         import matplotlib.pyplot as plt
+    #         F, T = spec_2d.shape
+    #         y0_khz, y1_khz = y_min_hz / 1000.0, y_max_hz / 1000.0
+    #         extent = [0, T, y0_khz, y1_khz]
+    #
+    #         vmin = np.percentile(spec_2d, 5)
+    #         vmax = np.percentile(spec_2d, 95)
+    #         if vmin == vmax:
+    #             vmin, vmax = float(spec_2d.min()), float(spec_2d.max())
+    #
+    #         plt.figure(figsize=figsize, dpi=dpi)
+    #         im = plt.imshow(
+    #             spec_2d, origin="lower", aspect="auto", extent=extent,
+    #             cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest"
+    #         )
+    #         plt.colorbar(im, pad=0.01, shrink=0.9)
+    #
+    #         # draw bin edges
+    #         if edges_hz is not None:
+    #             e1k, e2k = edges_hz[0] / 1000.0, edges_hz[1] / 1000.0
+    #             plt.axhline(e1k, color="white", linestyle="--", linewidth=0.9, alpha=0.9)
+    #             plt.axhline(e2k, color="white", linestyle="--", linewidth=0.9, alpha=0.9)
+    #
+    #         # per-frame rolloff curve
+    #         if fpf_hz is not None:
+    #             t = np.arange(T, dtype=np.float64)
+    #             fpf_khz = fpf_hz / 1000.0
+    #             m = np.isfinite(fpf_khz)
+    #             if np.any(m):
+    #                 plt.plot(t[m], fpf_khz[m], linewidth=1.1, alpha=0.95)
+    #
+    #         if title:
+    #             plt.title(title, fontsize=10)
+    #         if subtitle:
+    #             # top-left inside axes
+    #             ax = plt.gca()
+    #             ax.text(0.02, 0.98, subtitle, transform=ax.transAxes,
+    #                     fontsize=9, color="w",
+    #                     va="top", ha="left",
+    #                     bbox=dict(facecolor="0.05", alpha=0.55, pad=3, edgecolor="none"))
+    #
+    #         plt.xlabel("Time (frames)")
+    #         plt.ylabel("Frequency (kHz)")
+    #         plt.tight_layout()
+    #         plt.savefig(out_png, bbox_inches="tight")
+    #         plt.close()
+    #
+    #     # -------- per bin --------
+    #     for b in (0, 1, 2):
+    #         bin_dir = os.path.join(out_root, f"bin_{b}")
+    #         os.makedirs(bin_dir, exist_ok=True)
+    #
+    #         # First pass: decide SUM shape if not forced
+    #         shapes = []
+    #         for specs, _labels in bin_loaders[b]:
+    #             # specs: [B,1,F,T]
+    #             F = int(specs.shape[2])
+    #             T = int(specs.shape[3])
+    #             shapes.append((F, T))
+    #         if not shapes:
+    #             print(f"[{split_name}] bin {b}: no items")
+    #             continue
+    #
+    #         tgt = target_sum_shape or (max(s[0] for s in shapes), max(s[1] for s in shapes))
+    #
+    #         # Second pass: save individuals + accumulate SUM
+    #         spec_sum = np.zeros(tgt, dtype=np.float32)
+    #         running_idx = 0
+    #
+    #         for specs, _labels in bin_loaders[b]:
+    #             specs_np = specs.numpy()  # [B,1,F,T]
+    #             B = specs_np.shape[0]
+    #
+    #             for i in range(B):
+    #                 spec_2d = specs_np[i, 0]  # (F,T)
+    #
+    #                 # per-frame rolloff
+    #                 fpf_hz = per_frame_rolloff_hz(
+    #                     spec_2d, freq_axis_hz,
+    #                     p=p_rolloff,
+    #                     noise_percentile=noise_percentile,
+    #                     min_frame_energy_ratio=min_frame_energy_ratio,
+    #                 )
+    #                 good = np.isfinite(fpf_hz)
+    #                 bins = (np.array([_bin_index_from_edges(x, edges_hz) for x in fpf_hz[good]], dtype=int)
+    #                         if np.any(good) else np.array([], dtype=int))
+    #
+    #                 counts = np.bincount(bins, minlength=3) if bins.size else np.array([0, 0, 0])
+    #                 total = int(counts.sum()) if bins.size else 0
+    #                 fracs = counts / total if total > 0 else np.array([0.0, 0.0, 0.0], dtype=float)
+    #                 fL, fM, fH = map(float, fracs)
+    #
+    #                 # MID-priority rule (same as training)
+    #                 if fM >= mid_priority_frac:
+    #                     decided, rule = 1, "mid_priority"
+    #                 elif counts[0] == 0 and counts[1] == 0 and counts[2] > 0:
+    #                     decided, rule = 2, "only_high"
+    #                 elif (counts[0] > counts[1]) and (counts[0] >= counts[2]):
+    #                     decided, rule = 0, "low_majority"
+    #                 else:
+    #                     decided, rule = int(np.argmax(counts)), "argmax"
+    #
+    #                 subtitle = f"L/M/H={counts.tolist()}  frac=[{fL:.2f},{fM:.2f},{fH:.2f}]  → bin {decided} ({rule})"
+    #
+    #                 # save individual
+    #                 out_png = os.path.join(bin_dir, _safe(f"{split_name}_b{b}_item_{running_idx:06d}.png"))
+    #                 _save_spec_png_linaxis(
+    #                     spec_2d, out_png,
+    #                     fpf_hz=fpf_hz, edges_hz=edges_hz,
+    #                     title=None, subtitle=subtitle,
+    #                     cmap=cmap, dpi=dpi_ind, figsize=(5.8, 4.4),
+    #                 )
+    #
+    #                 # accumulate SUM
+    #                 r = _resize_to(spec_2d, tgt).astype(np.float32)
+    #                 if per_item_normalize:
+    #                     mx = float(r.max())
+    #                     if mx > 0:
+    #                         r = r / mx
+    #                 spec_sum += r
+    #                 running_idx += 1
+    #
+    #         # write SUM image + raw npy
+    #         sum_png = os.path.join(bin_dir, "SUM_spectrogram.png")
+    #         _save_spec_png_linaxis(
+    #             spec_sum, sum_png,
+    #             fpf_hz=None, edges_hz=edges_hz,  # show edges on SUM for context
+    #             title=f"{split_name.upper()} bin {b} — SUM", subtitle=None,
+    #             cmap=cmap, dpi=dpi_sum, figsize=(6.2, 4.6),
+    #         )
+    #         np.save(os.path.join(bin_dir, "SUM_spectrogram.npy"), spec_sum)
+    #         print(f"[{split_name}] bin {b}: saved individuals + SUM -> {bin_dir}")
 
-    def _safe(text: str) -> str:
-        return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(text))
-
-    def _save_spec_png_linaxis(spec_2d: np.ndarray, out_png: str, mean_freq_hz: float,
-                               y_min_hz: float, y_max_hz: float,
-                               cmap="magma", dpi=180, figsize=(5.0, 4.0)):
-        import matplotlib.pyplot as plt
-        y0_khz, y1_khz = y_min_hz / 1000.0, y_max_hz / 1000.0
-        extent = [0, spec_2d.shape[1], y0_khz, y1_khz]
-
-        vmin = np.percentile(spec_2d, 5)
-        vmax = np.percentile(spec_2d, 95)
-        if vmin == vmax:
-            vmin, vmax = float(spec_2d.min()), float(spec_2d.max())
-
-        plt.figure(figsize=figsize, dpi=dpi)
-        im = plt.imshow(
-            spec_2d, origin="lower", aspect="auto", extent=extent,
-            cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest"
-        )
-        plt.colorbar(im, pad=0.01, shrink=0.9)
-        plt.axhline(mean_freq_hz / 1000.0, color="white", linestyle="--", linewidth=1.0, alpha=0.9)
-        plt.xlabel("Time (frames)")
-        plt.ylabel("Frequency (kHz)")
-        plt.tight_layout()
-        plt.savefig(out_png, bbox_inches="tight")
-        plt.close()
-
-    def _resize_to(arr: np.ndarray, target_shape):
-        F0, T0 = arr.shape
-        Ft, Tt = target_shape
-        if (F0, T0) == (Ft, Tt):
-            return arr
-        return zoom(arr, (Ft / max(F0, 1), Tt / max(T0, 1)), order=1)
-
-    def _dump_for_split(split_name: str, bin_loaders: dict, out_root: str,
-                        per_item_normalize=True, target_sum_shape=None):
-        os.makedirs(out_root, exist_ok=True)
-        for b in (0, 1, 2):
-            bin_dir = os.path.join(out_root, f"bin_{b}")
-            os.makedirs(bin_dir, exist_ok=True)
-
-            # First pass: figure target sum shape (if not forced)
-            shapes = []
-            for specs, labels in bin_loaders[b]:
-                # specs: [B, 1, F, T]
-                F = specs.shape[2]
-                T = specs.shape[3]
-                shapes.append((F, T))
-            if not shapes:
-                print(f"[{split_name}] bin {b}: no items")
-                continue
-
-            if target_sum_shape is None:
-                Ft = max(s[0] for s in shapes)
-                Tt = max(s[1] for s in shapes)
-                tgt = (Ft, Tt)
-            else:
-                tgt = target_sum_shape
-
-            # Second pass: save individuals + accumulate SUM
-            spec_sum = np.zeros(tgt, dtype=np.float32)
-            running_idx = 0
-
-            # Re-iterate (no shuffle) to align with file order
-            for specs, labels in bin_loaders[b]:
-                # specs: [B, 1, F, T]
-                specs_np = specs.numpy()  # CPU tensors by default in DataLoader
-                B = specs_np.shape[0]
-
-                for i in range(B):
-                    spec_2d = specs_np[i, 0]  # [F, T]
-                    # compute stat frequency in Hz w.r.t. your linear freq axis
-                    #mean_hz = float(calc_mean_freq(spec_2d, freq_axis=FREQ_AXIS))
-                    est_hz = float(calc_energy_weighted_median_hz(spec_2d, freq_axis=FREQ_AXIS))
-
-                    # save individual
-                    name = f"{split_name}_b{b}_item_{running_idx:06d}.png"
-                    out_png = os.path.join(bin_dir, _safe(name))
-                    _save_spec_png_linaxis(
-                        spec_2d, out_png, est_hz,
-                        y_min_hz=MIN_FREQ_HZ, y_max_hz=MAX_FREQ_HZ,
-                        cmap="magma", dpi=180, figsize=(5.0, 4.0)
-                    )
-
-                    # add to SUM (resize + optional per-item normalization)
-                    r = _resize_to(spec_2d, tgt).astype(np.float32)
-                    if per_item_normalize:
-                        mx = r.max()
-                        if mx > 0:
-                            r = r / mx
-                    spec_sum += r
-
-                    running_idx += 1
-
-            # write SUM image + raw npy
-            sum_png = os.path.join(bin_dir, "SUM_spectrogram.png")
-            _save_spec_png_linaxis(
-                spec_sum, sum_png, mean_freq_hz=MIN_FREQ_HZ-1,  # line outside range (no visible line)
-                y_min_hz=MIN_FREQ_HZ, y_max_hz=MAX_FREQ_HZ,
-                cmap="magma", dpi=200, figsize=(6.0, 4.5)
-            )
-            np.save(os.path.join(bin_dir, "SUM_spectrogram.npy"), spec_sum)
-            print(f"[{split_name}] bin {b}: saved individuals + SUM -> {bin_dir}")
-
-
-
+    # ---------------- end plugin ---------------------
 
     # 3) model + checkpoint
     ckpt_path = latest_checkpoint(CKPT_DIR)
@@ -485,11 +600,6 @@ def main():
     spec_out_train = os.path.join(out_dir, "spec_bins_train")
     spec_out_test = os.path.join(out_dir, "spec_bins_test")
 
-    # Dump both splits (you can comment one out if you only want test)
-    _dump_for_split("train", train_bin_loaders, spec_out_train,
-                    per_item_normalize=True, target_sum_shape=None)
-    _dump_for_split("test", test_bin_loaders, spec_out_test,
-                    per_item_normalize=True, target_sum_shape=None)
 
     # 4) evaluation
     with torch.no_grad():
@@ -508,7 +618,7 @@ def main():
             {
                 "ckpt": os.path.abspath(ckpt_path),
                 "epoch": ckpt.get("epoch"),
-                "n_test_batches": len(test_loader),
+                "n_test_batches": len(test_loader_cond),
                 "device": str(device),
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
@@ -528,10 +638,15 @@ def main():
             super().__init__()
             self.base = base_model
             self.c = c_onehot.to(base_model.device).to(torch.float32)
-            self.device = base_model.device  # so your plot code still works
 
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.base, name)
+
+        @torch.no_grad()
         def forward(self, z, mod=False, random=False):
-            # delegate to the real model, always passing the fixed c
             return self.base(z, mod=mod, random=random, c=self.c)
 
     onehots = {
@@ -613,6 +728,24 @@ def main():
         plot_bin_train_test(emb_tr, emb_te, b, out_dir_fig)
 
     ## ------ DBG -------
+    # dump_specs_by_bin(
+    #     split_name="train",
+    #     bin_loaders=train_bin_loaders,
+    #     out_root=os.path.join(out_dir, "spec_bins_train"),
+    #     freq_axis_hz=FREQ_AXIS_GLOBAL,
+    #     edges_hz=(22_000.0, 27_000.0),
+    #     mid_priority_frac=0.25,
+    # )
+    #
+    # dump_specs_by_bin(
+    #     split_name="test",
+    #     bin_loaders=test_bin_loaders,
+    #     out_root=os.path.join(out_dir, "spec_bins_test"),
+    #     freq_axis_hz=FREQ_AXIS_GLOBAL,
+    #     edges_hz=(22_000.0, 27_000.0),
+    #     mid_priority_frac=0.25,
+    # )
+
     lin0 = model.decoder[0]  # Linear(in_features=4+3, out=64)
     W = lin0.weight.detach().cpu().numpy()  # [64, 7]
     W_basis = W[:, :4]  # for latent basis (2*latent_dim)

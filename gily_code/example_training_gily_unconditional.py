@@ -92,43 +92,87 @@ if __name__ == "__main__":
     # Combine families across experiments
     roots_per_family = {
         1: [r"D:\Data\235",r"D:\Data\237"],
-        2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"], #r"D:\Data\112",
+        #2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"], #r"D:\Data\112",
     }
     out_dir = fr"D:\data\model_checkpoints"
     os.makedirs(out_dir, exist_ok=True)
-    CF = "rule3_bands"
+
 
 
     # ----- load files with spectrograms ------
     ### specs_per_file is how many spectrograms are in each .hdf5 file, all files have 100 vocalization each, families is the family number we're trying to load,
     ### test_size - portion of the data that will remain unseen in training, seed is used to maintain reproducibility, check determines whether we check to see if
-    (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils_multi(gerbil_filepath=roots_per_family, specs_per_file=100, families=[1,2], test_size=0.2, seed=92, check=True)
+    (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils_multi(gerbil_filepath=roots_per_family, specs_per_file=100, families=[1], test_size=0.2, seed=92, check=True)
 
-    COND = True  #  using conditionals
-    BATCH = 1 if COND else 64
-    c_dimension= 3 if COND else 1
 
     # ----- load datasets (train / test) : single samples -----
-    # Miles used: transform=lambda x: torch.from_numpy(x).to(torch.float32).unsqueeze(0),  but I can't use lambda on multiprocessing in Windows
-    # returns either (spec, c, syll_id) or (spec, syll_id)
-    if COND:
-        train_dataset_cond = bird_data(train_fns, train_ids,specs_per_file=specs_per_file,transform=spec_to_tensor,conditional=True,conditional_factor=CF)     # Unfortunately, transform has to be a little weird because of how I saved the spectrograms. This performs these operations on each spectrogram before returning them
-        test_dataset_cond = bird_data(test_fns, test_ids,specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=True,conditional_factor=CF)
-    else:
-        train_dataset = bird_data(train_fns, train_ids, specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=False)
-        test_dataset = bird_data(test_fns, test_ids, specs_per_file=specs_per_file,transform=spec_to_tensor, conditional=False)
 
+    # --- BIN THE DATA ONCE using the rule-based conditional dataset ---
+    # We only use this to get the bin index per item.
+    train_ds_cond = bird_data(
+        train_fns, train_ids, specs_per_file=specs_per_file,
+        transform=spec_to_tensor, conditional=True, conditional_factor="rule3_bands"
+    )
+    test_ds_cond = bird_data(
+        test_fns, test_ids, specs_per_file=specs_per_file,
+        transform=spec_to_tensor, conditional=True, conditional_factor="rule3_bands"
+    )
+
+    # Plain (unconditional) datasets used for training each model
+    train_ds_plain = bird_data(
+        train_fns, train_ids, specs_per_file=specs_per_file,
+        transform=spec_to_tensor, conditional=False
+    )
+    test_ds_plain = bird_data(
+        test_fns, test_ids, specs_per_file=specs_per_file,
+        transform=spec_to_tensor, conditional=False
+    )
+
+    # Collect indices per bin (0=low, 1=alarm, 2=high)
+    bin_to_idx_tr = {0: [], 1: [], 2: []}
+    for i in range(len(train_ds_cond)):
+        _, c, _ = train_ds_cond[i]
+        bin_to_idx_tr[int(c.argmax().item())].append(i)
+
+    bin_to_idx_te = {0: [], 1: [], 2: []}
+    for i in range(len(test_ds_cond)):
+        _, c, _ = test_ds_cond[i]
+        bin_to_idx_te[int(c.argmax().item())].append(i)
+
+    from torch.utils.data import Subset
+
+    # Build per-bin loaders on the PLAIN datasets (unconditional)
+    BATCH_UNCOND = 64
     use_cuda = torch.cuda.is_available()
-    pin = bool(use_cuda) # speeds up GPU transfers
+    pin = bool(use_cuda)
 
-    # ----- delivers mini-batches using dataset (of size batch_size), may shuffle sample order each epoch-----
-    if COND:
-        train_loader = DataLoader(train_dataset_cond,batch_size=BATCH,num_workers=n_workers,shuffle=True, pin_memory=pin)
-        test_loader = DataLoader(test_dataset_cond,batch_size=BATCH,num_workers=n_workers,shuffle=False, pin_memory=pin)
-    else:
-        train_loader = DataLoader(train_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=True, pin_memory=pin)
-        test_loader = DataLoader(test_dataset,batch_size=BATCH,num_workers=n_workers,shuffle=False, pin_memory=pin)
 
+    from torch.utils.data import Subset
+
+    loaders_per_bin = {}
+    for b in (0, 1, 2):
+        tr_subset = Subset(train_ds_plain, bin_to_idx_tr[b])
+        te_subset = Subset(test_ds_plain, bin_to_idx_te[b])
+        ntr, nte = len(tr_subset), len(te_subset)
+
+        if ntr == 0:
+            print(f"BIN {b}: empty (train=0, test={nte}) — skipping.")
+            loaders_per_bin[b] = {"train": None, "test": None, "n_train": 0, "n_test": nte}
+            continue
+
+        bs_tr = min(BATCH_UNCOND, ntr)
+        bs_te = min(BATCH_UNCOND, max(1, nte))
+
+        loaders_per_bin[b] = dict(
+            train=DataLoader(tr_subset, batch_size=bs_tr, shuffle=True,
+                             num_workers=n_workers, pin_memory=pin),
+            test=DataLoader(te_subset, batch_size=bs_te, shuffle=False,
+                            num_workers=n_workers, pin_memory=pin),
+            n_train=ntr,
+            n_test=nte,
+        )
+
+    print({b: (v["n_train"], v["n_test"]) for b, v in loaders_per_bin.items()})
 
     # # ----- DBG
     # from collections import Counter
@@ -161,39 +205,48 @@ if __name__ == "__main__":
         print(f"[DEVICE] GPU: {torch.cuda.get_device_name(0)}")
         print(f"[DEVICE] CUDA capability: {torch.cuda.get_device_capability(0)}")
         print(f"[DEVICE] cuDNN enabled: {torch.backends.cudnn.enabled}")
-
-    decoder = get_decoder_arch(dataset_name=dataset,latent_dim=latent_dim,arch="conditional_qmc",cond_dim=c_dimension) # get_decoder_arch has a set of fixed architectures --
-    ### if you want to play around with your own, you can make one using nn.Sequential (strings together layers). That's all that the
-    ### decoders are -- nn.Sequential instances
-    #%%
-    from train.losses import binary_evidence,binary_lp,gaussian_evidence,gaussian_lp
-    model = QMCLVM(latent_dim=latent_dim,device=device,decoder=decoder)
-
-
-    ########## test
-    first_linear = None
-    for m in model.decoder.modules():
-        if isinstance(m, nn.Linear):
-            first_linear = m
-            break
-
-    print("[CHECK] decoder[0]:", first_linear)  # will print: Linear(in_features=7, out_features=64, bias=True)
-    print("[CHECK] in_features:", first_linear.in_features)
-
-    ####################
-
-
-    ## binary evidence
-    qmc_loss_func = binary_evidence # I used this for training models, but we can also use gaussian (what the VAE uses)
-    qmc_lp = binary_lp
-
+    from train.losses import binary_evidence, binary_lp
     from train.train import train_loop
-    nEpochs=1
 
-    #### to speed up training, you can decrease grid size (decrease m) at the expense of model performance,
-    #### or increase batch size
-    model, opt, losses = train_loop(
-        model, train_loader, latent_grid.to(device), qmc_loss_func,
-        nEpochs=nEpochs, verbose=True, conditional=True,
-        out_dir=out_dir
-    )
+    qmc_loss_func = binary_evidence
+    qmc_lp = binary_lp
+    nEpochs = 1
+
+    # Train three separate UNCONDITIONAL models (one per bin)
+    for b in (0, 1, 2):
+        print(f"\n=== Training UNCONDITIONAL model on BIN {b} ===")
+
+        # Unconditional decoder; if you don't have 'qmc', you can still use 'conditional_qmc'
+        # with cond_dim=0, but most repos have a plain 'qmc' arch for unconditional training.
+        decoder = get_decoder_arch(dataset_name=dataset, latent_dim=latent_dim, arch="qmc")
+        model = QMCLVM(latent_dim=latent_dim, device=device, decoder=decoder)
+
+        # (optional) quick check of first linear
+        first_linear = None
+        for m in model.decoder.modules():
+            if isinstance(m, nn.Linear):
+                first_linear = m
+                break
+        if first_linear is not None:
+            print("[CHECK] decoder[0]:", first_linear)
+
+        bin_out_dir = os.path.join(out_dir, f"bin{b}")
+        os.makedirs(bin_out_dir, exist_ok=True)
+
+        model, opt, losses = train_loop(
+            model,
+            loaders_per_bin[b]["train"],  # <-- per-bin UNCONDITIONAL loader
+            latent_grid.to(device),
+            qmc_loss_func,
+            nEpochs=nEpochs,
+            verbose=True,
+            conditional=False,  # <-- key: UNCONDITIONAL
+            out_dir=bin_out_dir
+        )
+
+        # (optional) evaluate on that bin’s test set
+        from train.train import test_epoch
+
+        _ = test_epoch(model, loaders_per_bin[b]["test"], latent_grid.to(device),
+                       qmc_loss_func, conditional=False)
+
