@@ -232,88 +232,6 @@ def build_loaders():
             test_bin_loaders, train_bin_loaders,
             train_fns, test_fns)
 
-# def build_loaders():
-#     # From one folder
-#     # (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils(
-#     #     DATA_ROOT,
-#     #     specs_per_file=SPECS_PER_FILE,
-#     #     families=TEST_FAMILY_IDS,
-#     #     test_size=TEST_SIZE,
-#     #     seed=SPLIT_SEED,
-#     #     check=True,
-#     # )
-#     # From multiple folders
-#     (train_fns, test_fns), (train_ids, test_ids), specs_per_file = load_gerbils_multi(
-#         gerbil_filepath=DATA_ROOT,
-#         specs_per_file=SPECS_PER_FILE,
-#         families=TEST_FAMILY_IDS,
-#         test_size=TEST_SIZE,
-#         seed=SPLIT_SEED,
-#         check=True,
-#     )
-#
-#     # gets one sample at a time by index via __getitem__ and knows how many samples exist via __len__, each item is (spec,family_id) or (spec,c,family_id)
-#     test_ds_cond = bird_data(test_fns, test_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=True, conditional_factor=COND_FACTOR)
-#     train_ds_cond = bird_data(train_fns, train_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=True, conditional_factor=COND_FACTOR)
-#
-#     test_ds = bird_data(test_fns, test_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=False)
-#     train_ds = bird_data(train_fns, train_ids, specs_per_file=specs_per_file, transform=spec_to_tensor, conditional=False)
-#
-#     # wraps the dataset to give mini-batches, splits by batch_size
-#     train_loader_cond = DataLoader(train_ds_cond, batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
-#     test_loader_cond  = DataLoader(test_ds_cond,  batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
-#
-#     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
-#     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,num_workers=NUM_WORKERS, pin_memory=True)
-#
-#     # ---- which example is from which bin? ----
-#     bin_to_idxs = {0: [], 1: [], 2: []}
-#     tmp = DataLoader(test_ds_cond, batch_size=128, shuffle=False, num_workers=0) # iterates the dataset one after the other
-#     idx = 0
-#     for _, c, _ in tmp:
-#         # c: [B,3] one-hot; get bin ids
-#         bins = c.argmax(dim=1).tolist() # the bin of each sample [2, 2, 1, 0, 2, ...]
-#         for b in bins:
-#             bin_to_idxs[b].append(idx) # vecotr of sample indices for each bin
-#             idx += 1
-#             # bin_to_idxs = {
-#             #   0: [0, 7, 11, ...],
-#             #   1: [2, 5, 8, ...],
-#             #   2: [1, 3, 4, 6, 9, ...],
-#             # }
-#
-#     # Per-bin PLAIN views (drop c), so embed_data sees (data,label)
-#     test_bin_views = {
-#         b: _PlainView(test_ds_cond, bin_to_idxs[b]) for b in (0, 1, 2)
-#     }
-#     test_bin_loaders = { # build dataLoader per bin
-#         b: DataLoader(test_bin_views[b], batch_size=BATCH_SIZE, shuffle=False,
-#                       num_workers=NUM_WORKERS, pin_memory=True)
-#         for b in (0, 1, 2)
-#     }
-#
-#     # ---- TRAIN: which example is from which bin? (mirror of your TEST block) ----
-#     train_bin_to_idxs = {0: [], 1: [], 2: []}
-#     tmp_tr = DataLoader(train_ds_cond, batch_size=128, shuffle=False, num_workers=0)
-#     idx = 0
-#     for _, c, _ in tmp_tr:
-#         bins = c.argmax(dim=1).tolist()
-#         for b in bins:
-#             train_bin_to_idxs[b].append(idx)
-#             idx += 1
-#
-#     train_bin_views = {b: _PlainView(train_ds_cond, train_bin_to_idxs[b]) for b in (0, 1, 2)}
-#     train_bin_loaders = {
-#         b: DataLoader(train_bin_views[b], batch_size=BATCH_SIZE, shuffle=False,
-#                       num_workers=NUM_WORKERS, pin_memory=True)
-#         for b in (0, 1, 2)
-#     }
-#
-#     return (train_loader_cond, test_loader_cond,
-#             train_loader, test_loader,
-#             test_bin_loaders, train_bin_loaders,  # <— add this
-#             train_fns, test_fns)
-
 
 
 def rebuild_model(device):
@@ -336,6 +254,161 @@ def load_model_weights(model, ckpt_path, device):
     return ckpt, train_losses
 
 
+
+# ------------------------
+# New
+#-----------------
+# ---
+# Helpers for embedding by groups (per-bin)
+# ---
+
+def _gather_bin_indices(ds_cond) -> dict[int, list[int]]:
+    """
+    Iterate a (spec, c, label) dataset in file-major order and return
+    {bin_id: [global item indices]} with no shuffling.
+    """
+    bin_to_idxs = {0: [], 1: [], 2: []}
+    tmp = DataLoader(ds_cond, batch_size=128, shuffle=False, num_workers=0)
+    idx = 0
+    for _, c, _ in tmp:                # c is one-hot [B,3]
+        bins = c.argmax(dim=1).tolist()
+        for b in bins:
+            bin_to_idxs[b].append(idx)
+            idx += 1
+    return bin_to_idxs
+
+def _read_locations_for_file(h5_path):
+    with h5py.File(h5_path, 'r') as f:
+        locs = f['locations'][:]  # bytes array, len = specs_per_file
+    return np.array([x.decode('ASCII') for x in locs], dtype=object)
+
+def build_locations_vector(file_list):
+    """
+    Returns a 1D array of strings aligned with the order that bird_data
+    (no shuffle) iterates: concatenate per-file locations in file-major order.
+    """
+    out = []
+    for p in file_list:
+        out.extend(_read_locations_for_file(p))
+    return np.array(out, dtype=object)
+
+def _loc_bucketize(loc_str_array: np.ndarray) -> np.ndarray:
+    """Map location strings -> {'arena', 'underground'}."""
+    s = np.char.lower(loc_str_array.astype(str))
+    arena_mask = np.logical_or(np.char.find(s, "arena_1") >= 0,
+                               np.char.find(s, "arena_2") >= 0)
+    out = np.where(arena_mask, "arena", "underground")
+    return out
+
+def _nice_colors(n):
+    base = ["C0","C1","C2","C3","C4","C5","C6","C7","C8","C9"]
+    if n <= len(base):
+        return base[:n]
+    return [base[i % len(base)] for i in range(n)]
+
+def _plot_triptych_by_groups(emb_xy: np.ndarray,
+                             groups: np.ndarray,
+                             group_order: list,
+                             group_display: list,
+                             colors: list,
+                             title_prefix: str,
+                             split_name: str,
+                             bin_id: int,
+                             out_dir: str,
+                             file_tag: str):
+    """
+    Make 3 panels for one split/bin:
+      (1) combined overlay (all groups, colored)
+      (2) group A only
+      (3) group B only
+    If there are >2 groups (families), panel (2/3) show first two groups by order.
+    """
+    if emb_xy.size == 0:
+        return
+
+    # --- (1) combined overlay ---
+    fig, ax = plt.subplots(figsize=(6.6, 6.0))
+    for name, col in zip(group_order, colors):
+        m = (groups == name)
+        if np.any(m):
+            ax.scatter(emb_xy[m, 0], emb_xy[m, 1], s=6, marker=".", alpha=0.9, c=col, label=str(name))
+    format_plot_axis(ax, xlim=(0,1), ylim=(0,1),
+                     xlabel="Latent dim 1", ylabel="Latent dim 2",
+                     title=f"{title_prefix} — {split_name} — bin {bin_id}")
+    ax.legend(frameon=False, loc="best", markerscale=1.6)
+    plt.tight_layout()
+    fn = os.path.join(out_dir, f"{file_tag}_combined_{split_name}_bin{bin_id}.png")
+    plt.savefig(fn, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # choose up to two groups for the separate panels
+    gA = group_order[0] if len(group_order) > 0 else None
+    gB = group_order[1] if len(group_order) > 1 else None
+    colA = colors[0] if len(colors) > 0 else "C0"
+    colB = colors[1] if len(colors) > 1 else "C1"
+
+    # --- (2) separate panel for group A ---
+    if gA is not None:
+        fig, ax = plt.subplots(figsize=(6.0, 6.0))
+        m = (groups == gA)
+        if np.any(m):
+            ax.scatter(emb_xy[m, 0], emb_xy[m, 1], s=7, marker=".", alpha=0.95, c=colA)
+        format_plot_axis(ax, xlim=(0,1), ylim=(0,1),
+                         xlabel="Latent dim 1", ylabel="Latent dim 2",
+                         title=f"{title_prefix}: {group_display[0]} — {split_name} — bin {bin_id}")
+        plt.tight_layout()
+        fn = os.path.join(out_dir, f"{file_tag}_onlyA_{split_name}_bin{bin_id}.png")
+        plt.savefig(fn, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    # --- (3) separate panel for group B ---
+    if gB is not None:
+        fig, ax = plt.subplots(figsize=(6.0, 6.0))
+        m = (groups == gB)
+        if np.any(m):
+            ax.scatter(emb_xy[m, 0], emb_xy[m, 1], s=7, marker=".", alpha=0.95, c=colB)
+        format_plot_axis(ax, xlim=(0,1), ylim=(0,1),
+                         xlabel="Latent dim 1", ylabel="Latent dim 2",
+                         title=f"{title_prefix}: {group_display[1]} — {split_name} — bin {bin_id}")
+        plt.tight_layout()
+        fn = os.path.join(out_dir, f"{file_tag}_onlyB_{split_name}_bin{bin_id}.png")
+        plt.savefig(fn, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+def plot_family_triptych(emb_xy: np.ndarray,
+                         fam_labels: np.ndarray,
+                         split_name: str,
+                         bin_id: int,
+                         out_dir: str):
+    fams = list(np.unique(fam_labels))
+    colors = _nice_colors(len(fams))
+    display = [f"family {int(f)}" for f in fams]
+    _plot_triptych_by_groups(emb_xy, fam_labels, fams, display, colors,
+                             title_prefix="Embeddings by family",
+                             split_name=split_name, bin_id=bin_id,
+                             out_dir=out_dir, file_tag="emb_by_family")
+
+def plot_location_triptych(emb_xy: np.ndarray,
+                           loc_bucket: np.ndarray,
+                           split_name: str,
+                           bin_id: int,
+                           out_dir: str):
+    order = ["arena", "underground"]
+    colors = ["C0", "C3"]
+    display = ["arena", "underground"]
+    _plot_triptych_by_groups(emb_xy, loc_bucket, order, display, colors,
+                             title_prefix="Embeddings by location",
+                             split_name=split_name, bin_id=bin_id,
+                             out_dir=out_dir, file_tag="emb_by_location")
+
+
+
+
+
+
+# -------------------------------------------------------------------------------
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -351,240 +424,17 @@ def main():
      test_bin_loaders, train_bin_loaders,
      train_fns, test_fns) = build_loaders()
 
-    # 2.5) plot spectrograms in bins
-    # =========================
-    # DUMP: per-bin spectrogram PNGs (train & test), plus a SUM image per bin
-    # =========================
-    # We use the dataset bins (0/1/2) you already built, compute each item's mean frequency on-the-fly,
-    # save the individual spectrograms with a y-axis in kHz from MIN_FREQ_HZ..MAX_FREQ_HZ,
-    # draw a dashed line at the mean frequency, and create one summed spectrogram per bin.
+    # 2.5 for embedding
+    # Indices per bin in dataset order (no shuffle)
+    train_bin_to_idxs = _gather_bin_indices(train_loader_cond.dataset)
+    test_bin_to_idxs = _gather_bin_indices(test_loader_cond.dataset)
 
-    # # from data.bird_data import calc_energy_weighted_median_hz
-    # from data.bird_data import calc_mean_freq
-    # from data.bird_data import per_frame_rolloff_hz, _bin_index_from_edges
-    # EDGES_HZ = (22_000.0, 27_000.0)  # match your dataset’s edges
+    # Locations aligned to dataset order
+    train_locs_all = build_locations_vector(train_fns)  # len = #items in train set
+    test_locs_all = build_locations_vector(test_fns)
+
     FREQ_AXIS = FREQ_AXIS_GLOBAL
-    #
-    # def _safe(text: str) -> str:
-    #     return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(text))
-    #
-    # # def _save_spec_png_linaxis(spec_2d: np.ndarray, out_png: str, mean_freq_hz: float,
-    # #                            y_min_hz: float, y_max_hz: float,
-    # #                            cmap="magma", dpi=180, figsize=(5.0, 4.0)):
-    # #     import matplotlib.pyplot as plt
-    # #     y0_khz, y1_khz = y_min_hz / 1000.0, y_max_hz / 1000.0
-    # #     extent = [0, spec_2d.shape[1], y0_khz, y1_khz]
-    # #
-    # #     vmin = np.percentile(spec_2d, 5)
-    # #     vmax = np.percentile(spec_2d, 95)
-    # #     if vmin == vmax:
-    # #         vmin, vmax = float(spec_2d.min()), float(spec_2d.max())
-    # #
-    # #     plt.figure(figsize=figsize, dpi=dpi)
-    # #     im = plt.imshow(
-    # #         spec_2d, origin="lower", aspect="auto", extent=extent,
-    # #         cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest"
-    # #     )
-    # #     plt.colorbar(im, pad=0.01, shrink=0.9)
-    # #     plt.axhline(mean_freq_hz / 1000.0, color="white", linestyle="--", linewidth=1.0, alpha=0.9)
-    # #     plt.xlabel("Time (frames)")
-    # #     plt.ylabel("Frequency (kHz)")
-    # #     plt.tight_layout()
-    # #     plt.savefig(out_png, bbox_inches="tight")
-    # #     plt.close()
-    # # ------------------ dump plugin ------------------
-    # # Save spectrograms grouped by bin, with per-frame rolloff overlay and SUM image.
-    #
-    # import os, numpy as np
-    # from scipy.ndimage import zoom
-    #
-    # def dump_specs_by_bin(
-    #         split_name: str,
-    #         bin_loaders: dict,  # {0: DataLoader, 1: DataLoader, 2: DataLoader}
-    #         out_root: str,
-    #         freq_axis_hz: np.ndarray,  # e.g., np.linspace(MIN_FREQ_HZ, MAX_FREQ_HZ, NUM_FREQ_BINS)
-    #         edges_hz: tuple[float, float] = (22_000.0, 27_000.0),
-    #         *,
-    #         per_item_normalize: bool = True,  # normalize each spec before adding to SUM
-    #         target_sum_shape: tuple[int, int] | None = None,  # (F,T) to force SUM size
-    #         # per-frame rolloff params:
-    #         p_rolloff: float = 0.50,
-    #         noise_percentile: float = 5.0,
-    #         min_frame_energy_ratio: float = 1e-4,
-    #         # MID-priority rule:
-    #         mid_priority_frac: float = 0.25,
-    #         # visuals:
-    #         cmap: str = "magma", dpi_ind: int = 180, dpi_sum: int = 200,
-    # ):
-    #     """
-    #     Writes PNGs into {out_root}/bin_{b}/ for b in {0,1,2}.
-    #     Each individual PNG shows the spectrogram, dashed edges at edges_hz,
-    #     a per-frame rolloff trace, and a subtitle with counts/fractions/decision.
-    #     Also writes a SUM_spectrogram.png (+ .npy) per bin.
-    #     """
-    #     # lazy imports from your bird_data
-    #     from data.bird_data import per_frame_rolloff_hz, _bin_index_from_edges
-    #
-    #     os.makedirs(out_root, exist_ok=True)
-    #     y_min_hz = float(freq_axis_hz.min())
-    #     y_max_hz = float(freq_axis_hz.max())
-    #
-    #     def _safe(text: str) -> str:
-    #         return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(text))
-    #
-    #     def _resize_to(arr: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
-    #         F0, T0 = arr.shape
-    #         Ft, Tt = target_shape
-    #         if (F0, T0) == (Ft, Tt):
-    #             return arr
-    #         return zoom(arr, (Ft / max(F0, 1), Tt / max(T0, 1)), order=1)
-    #
-    #     def _save_spec_png_linaxis(
-    #             spec_2d: np.ndarray,
-    #             out_png: str,
-    #             *,
-    #             fpf_hz: np.ndarray | None = None,  # per-frame rolloff
-    #             edges_hz: tuple[float, float] | None = None,
-    #             title: str | None = None,
-    #             subtitle: str | None = None,
-    #             cmap: str = "magma",
-    #             dpi: int = 180,
-    #             figsize: tuple[float, float] = (5.8, 4.4),
-    #     ):
-    #         import matplotlib.pyplot as plt
-    #         F, T = spec_2d.shape
-    #         y0_khz, y1_khz = y_min_hz / 1000.0, y_max_hz / 1000.0
-    #         extent = [0, T, y0_khz, y1_khz]
-    #
-    #         vmin = np.percentile(spec_2d, 5)
-    #         vmax = np.percentile(spec_2d, 95)
-    #         if vmin == vmax:
-    #             vmin, vmax = float(spec_2d.min()), float(spec_2d.max())
-    #
-    #         plt.figure(figsize=figsize, dpi=dpi)
-    #         im = plt.imshow(
-    #             spec_2d, origin="lower", aspect="auto", extent=extent,
-    #             cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest"
-    #         )
-    #         plt.colorbar(im, pad=0.01, shrink=0.9)
-    #
-    #         # draw bin edges
-    #         if edges_hz is not None:
-    #             e1k, e2k = edges_hz[0] / 1000.0, edges_hz[1] / 1000.0
-    #             plt.axhline(e1k, color="white", linestyle="--", linewidth=0.9, alpha=0.9)
-    #             plt.axhline(e2k, color="white", linestyle="--", linewidth=0.9, alpha=0.9)
-    #
-    #         # per-frame rolloff curve
-    #         if fpf_hz is not None:
-    #             t = np.arange(T, dtype=np.float64)
-    #             fpf_khz = fpf_hz / 1000.0
-    #             m = np.isfinite(fpf_khz)
-    #             if np.any(m):
-    #                 plt.plot(t[m], fpf_khz[m], linewidth=1.1, alpha=0.95)
-    #
-    #         if title:
-    #             plt.title(title, fontsize=10)
-    #         if subtitle:
-    #             # top-left inside axes
-    #             ax = plt.gca()
-    #             ax.text(0.02, 0.98, subtitle, transform=ax.transAxes,
-    #                     fontsize=9, color="w",
-    #                     va="top", ha="left",
-    #                     bbox=dict(facecolor="0.05", alpha=0.55, pad=3, edgecolor="none"))
-    #
-    #         plt.xlabel("Time (frames)")
-    #         plt.ylabel("Frequency (kHz)")
-    #         plt.tight_layout()
-    #         plt.savefig(out_png, bbox_inches="tight")
-    #         plt.close()
-    #
-    #     # -------- per bin --------
-    #     for b in (0, 1, 2):
-    #         bin_dir = os.path.join(out_root, f"bin_{b}")
-    #         os.makedirs(bin_dir, exist_ok=True)
-    #
-    #         # First pass: decide SUM shape if not forced
-    #         shapes = []
-    #         for specs, _labels in bin_loaders[b]:
-    #             # specs: [B,1,F,T]
-    #             F = int(specs.shape[2])
-    #             T = int(specs.shape[3])
-    #             shapes.append((F, T))
-    #         if not shapes:
-    #             print(f"[{split_name}] bin {b}: no items")
-    #             continue
-    #
-    #         tgt = target_sum_shape or (max(s[0] for s in shapes), max(s[1] for s in shapes))
-    #
-    #         # Second pass: save individuals + accumulate SUM
-    #         spec_sum = np.zeros(tgt, dtype=np.float32)
-    #         running_idx = 0
-    #
-    #         for specs, _labels in bin_loaders[b]:
-    #             specs_np = specs.numpy()  # [B,1,F,T]
-    #             B = specs_np.shape[0]
-    #
-    #             for i in range(B):
-    #                 spec_2d = specs_np[i, 0]  # (F,T)
-    #
-    #                 # per-frame rolloff
-    #                 fpf_hz = per_frame_rolloff_hz(
-    #                     spec_2d, freq_axis_hz,
-    #                     p=p_rolloff,
-    #                     noise_percentile=noise_percentile,
-    #                     min_frame_energy_ratio=min_frame_energy_ratio,
-    #                 )
-    #                 good = np.isfinite(fpf_hz)
-    #                 bins = (np.array([_bin_index_from_edges(x, edges_hz) for x in fpf_hz[good]], dtype=int)
-    #                         if np.any(good) else np.array([], dtype=int))
-    #
-    #                 counts = np.bincount(bins, minlength=3) if bins.size else np.array([0, 0, 0])
-    #                 total = int(counts.sum()) if bins.size else 0
-    #                 fracs = counts / total if total > 0 else np.array([0.0, 0.0, 0.0], dtype=float)
-    #                 fL, fM, fH = map(float, fracs)
-    #
-    #                 # MID-priority rule (same as training)
-    #                 if fM >= mid_priority_frac:
-    #                     decided, rule = 1, "mid_priority"
-    #                 elif counts[0] == 0 and counts[1] == 0 and counts[2] > 0:
-    #                     decided, rule = 2, "only_high"
-    #                 elif (counts[0] > counts[1]) and (counts[0] >= counts[2]):
-    #                     decided, rule = 0, "low_majority"
-    #                 else:
-    #                     decided, rule = int(np.argmax(counts)), "argmax"
-    #
-    #                 subtitle = f"L/M/H={counts.tolist()}  frac=[{fL:.2f},{fM:.2f},{fH:.2f}]  → bin {decided} ({rule})"
-    #
-    #                 # save individual
-    #                 out_png = os.path.join(bin_dir, _safe(f"{split_name}_b{b}_item_{running_idx:06d}.png"))
-    #                 _save_spec_png_linaxis(
-    #                     spec_2d, out_png,
-    #                     fpf_hz=fpf_hz, edges_hz=edges_hz,
-    #                     title=None, subtitle=subtitle,
-    #                     cmap=cmap, dpi=dpi_ind, figsize=(5.8, 4.4),
-    #                 )
-    #
-    #                 # accumulate SUM
-    #                 r = _resize_to(spec_2d, tgt).astype(np.float32)
-    #                 if per_item_normalize:
-    #                     mx = float(r.max())
-    #                     if mx > 0:
-    #                         r = r / mx
-    #                 spec_sum += r
-    #                 running_idx += 1
-    #
-    #         # write SUM image + raw npy
-    #         sum_png = os.path.join(bin_dir, "SUM_spectrogram.png")
-    #         _save_spec_png_linaxis(
-    #             spec_sum, sum_png,
-    #             fpf_hz=None, edges_hz=edges_hz,  # show edges on SUM for context
-    #             title=f"{split_name.upper()} bin {b} — SUM", subtitle=None,
-    #             cmap=cmap, dpi=dpi_sum, figsize=(6.2, 4.6),
-    #         )
-    #         np.save(os.path.join(bin_dir, "SUM_spectrogram.npy"), spec_sum)
-    #         print(f"[{split_name}] bin {b}: saved individuals + SUM -> {bin_dir}")
 
-    # ---------------- end plugin ---------------------
 
     # 3) model + checkpoint
     ckpt_path = latest_checkpoint(CKPT_DIR)
@@ -596,9 +446,7 @@ def main():
     out_dir = os.path.join(CKPT_DIR, f"eval_{run_id}")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Choose output roots under your checkpoint eval dir
-    spec_out_train = os.path.join(out_dir, "spec_bins_train")
-    spec_out_test = os.path.join(out_dir, "spec_bins_test")
+
 
 
     # 4) evaluation
@@ -673,564 +521,194 @@ def main():
 
     # embedding per bin
     # --- helper: side-by-side plot for one bin ---
-
-    def plot_bin_train_test(emb_train, emb_test, bin_id, out_dir):
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
-
-        ax = axes[0]
-        ax.scatter(emb_test[:, 0], emb_test[:, 1], s=3, marker=".", alpha=0.7, c="C0")
-        format_plot_axis(ax, xlim=(0, 1), ylim=(0, 1),
-                         xlabel="Latent dim 1", ylabel="Latent dim 2",
-                         title=f"Bin {bin_id} — Test")
-
-        ax = axes[1]
-        ax.scatter(emb_train[:, 0], emb_train[:, 1], s=3, marker=".", alpha=0.7, c="C0")
-        format_plot_axis(ax, xlim=(0, 1), ylim=(0, 1),
-                         xlabel="Latent dim 1", ylabel="Latent dim 2",
-                         title=f"Bin {bin_id} — Train")
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir_fig, f"embeddings_train_test_bin{bin_id}.png"),
-                    dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-    # --- embed per bin (train + test), still using embed_data ---
-    onehots = {
-        0: torch.tensor([[1., 0., 0.]], device=device),
-        1: torch.tensor([[0., 1., 0.]], device=device),
-        2: torch.tensor([[0., 0., 1.]], device=device),
-    }
-
-    for b in (0, 1, 2):
-        c_b = onehots[b]
-
-        # TEST embeddings in the c=b slice
-        emb_te, lab_te = model.embed_data(
-            latent_grid.to(device),
-            test_bin_loaders[b],  # yields (spec, label) for bin b
-            binary_lp,
-            embed_type="rqmc",
-            n_samples=5,
-            c=c_b,  # key: evaluate on the proper conditional slice
-        )
-
-        # TRAIN embeddings in the same slice
-        emb_tr, lab_tr = model.embed_data(
-            latent_grid.to(device),
-            train_bin_loaders[b],
-            binary_lp,
-            embed_type="rqmc",
-            n_samples=5,
-            c=c_b,
-        )
-
-        # plot side-by-side for this bin
-        plot_bin_train_test(emb_tr, emb_te, b, out_dir_fig)
-
-    ## ------ DBG -------
-    # dump_specs_by_bin(
-    #     split_name="train",
-    #     bin_loaders=train_bin_loaders,
-    #     out_root=os.path.join(out_dir, "spec_bins_train"),
-    #     freq_axis_hz=FREQ_AXIS_GLOBAL,
-    #     edges_hz=(22_000.0, 27_000.0),
-    #     mid_priority_frac=0.25,
-    # )
     #
-    # dump_specs_by_bin(
-    #     split_name="test",
-    #     bin_loaders=test_bin_loaders,
-    #     out_root=os.path.join(out_dir, "spec_bins_test"),
-    #     freq_axis_hz=FREQ_AXIS_GLOBAL,
-    #     edges_hz=(22_000.0, 27_000.0),
-    #     mid_priority_frac=0.25,
-    # )
-
-    lin0 = model.decoder[0]  # Linear(in_features=4+3, out=64)
-    W = lin0.weight.detach().cpu().numpy()  # [64, 7]
-    W_basis = W[:, :4]  # for latent basis (2*latent_dim)
-    W_c = W[:, 4:]  # for the 3 one-hot dims
-
-
-    print("||W_basis||_F =", np.linalg.norm(W_basis))
-    print("||W_c||_F     =", np.linalg.norm(W_c))
-    print("rowwise ||W_c|| mean:", np.mean(np.linalg.norm(W_c, axis=1)))
-
-    from data.bird_data import calc_mean_freq  # uses linear or  current weighting
-
-
-    # define the helper *inside* main; decorator and def must have the same indent
-    @torch.no_grad()
-    def _grid_meanfreq_map(model, z_grid, c_onehot):
-        X = model(z_grid, random=False, mod=False, c=c_onehot)  # [K,1,H,W]
-        vals = []
-        for i in range(X.shape[0]):
-            spec = X[i, 0].detach().cpu().numpy()
-            # pass the frequency axis so the result is in Hz
-            vals.append(calc_mean_freq(spec, freq_axis=FREQ_AXIS))
-        return np.asarray(vals, dtype=np.float64)
-
-    # ----- build the three maps -----
-    device = model.decoder[0].weight.device
-    z_grid = gen_fib_basis(m=15).to(device)
-    Z = (z_grid % 1).detach().cpu().numpy()
-
-    onehots = {
-        0: torch.tensor([[1., 0., 0.]], device=device),
-        1: torch.tensor([[0., 1., 0.]], device=device),
-        2: torch.tensor([[0., 0., 1.]], device=device),
-    }
-
-    m0 = _grid_meanfreq_map(model, z_grid, onehots[0])
-    m1 = _grid_meanfreq_map(model, z_grid, onehots[1])
-    m2 = _grid_meanfreq_map(model, z_grid, onehots[2])
-
-    # plotting (shared colorbar)
-    import matplotlib.colors as colors
-    # after you have m0, m1, m2 in Hz
-    vals_hz = [m0, m1, m2]
-    vals_khz = [v / 1000.0 for v in vals_hz]
-    titles = ["Bin 0 (<22 kHz)", "Bin 1 (22–25 kHz)", "Bin 2 (≥25 kHz)"]
-
-    # shared color scale in kHz
-    vmin_khz = min(map(np.min, vals_khz))
-    vmax_khz = max(map(np.max, vals_khz))
-    norm_khz = colors.Normalize(vmin=vmin_khz, vmax=vmax_khz)
-    cmap = "viridis"
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharex=True, sharey=True)
-    marker_size = 120
-    alpha = 0.98
-
-    for ax, v_khz, title in zip(axes, vals_khz, titles):
-        sc = ax.scatter(
-            Z[:, 0], Z[:, 1],
-            c=v_khz, s=marker_size, alpha=alpha,
-            cmap=cmap, norm=norm_khz,
-            edgecolors="none", linewidths=0,
-            rasterized=True
-        )
-        ax.set_title(title)
-        ax.set_xlim(0, 1);
-        ax.set_ylim(0, 1)
-        ax.set_aspect("equal", "box")
-        ax.set_xticks([]);
-        ax.set_yticks([])
-
-    # colorbar from the last scatter; all share same norm/cmap so this is fine
-    cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.92, pad=0.02)
-    cbar.set_label("Mean frequency (kHz)")
-
-    fig.tight_layout()
-    plt.savefig(os.path.join(out_dir_fig, "meanfreq_scatter_bins_big_khz.png"),
-                dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-    # ----- Non-conditional ------
-    # # 6c) latent embeddings scatter
-    # # Test data embedding
-    # test_embeddings, test_labels = model.embed_data(
-    #     latent_grid.to(device),
-    #     test_loader,
-    #     qmc_lp,
-    #     embed_type="rqmc",
-    #     n_samples=5,
-    # )
-    #
-    # # Train data embedding
-    # train_embeddings, train_labels = model.embed_data(
-    #     latent_grid.to(device),
-    #     train_loader,
-    #     qmc_lp,
-    #     embed_type="rqmc",
-    #     n_samples=5,
-    # )
-
-
-    # =========================
-    # Plot — all families together
-    # =========================
-
-   # fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
-
-    # Test
-    # ax = axes[0]
-    # ax.scatter(test_embeddings[:, 0], test_embeddings[:, 1],
-    #            s=3, alpha=0.6, c="C0", zorder=1)
-    # ax = format_plot_axis(
-    #     ax, xlim=(0, 1), ylim=(0, 1),
-    #     xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #     title="Test (all families pooled)"
-    # )
-    #
-    # # Train
-    # ax = axes[1]
-    # ax.scatter(train_embeddings[:, 0], train_embeddings[:, 1],
-    #            s=3,marker = ".", alpha=0.6, c="C0", zorder=1)
-    # ax = format_plot_axis(
-    #     ax, xlim=(0, 1), ylim=(0, 1),
-    #     xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #     title="Train (all families pooled)"
-    # )
-    #
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(out_dir_fig, "embeddings_allfamilies_train_vs_test.png"),
-    #             dpi=300, bbox_inches="tight")
-    # plt.show();
-    # plt.close(fig)
-
-    # =========================
-    # Plot - families seperately
-    # =========================
-    # ========= Per-family panels (same color), Train vs Test =========
-    # families_present = sorted(np.unique(np.concatenate([train_labels, test_labels])))
-    #
-    # for fam in families_present:
-    #     m_tr = (train_labels == fam)
-    #     m_te = (test_labels == fam)
-    #
+    # def plot_bin_train_test(emb_train, emb_test, bin_id, out_dir):
     #     fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
     #
-    #     # Test (family = fam)
     #     ax = axes[0]
-    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-    #                s=3,marker = ".", alpha=0.6, c="C0", zorder=1)
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Test — family {int(fam)}"
-    #     )
+    #     ax.scatter(emb_test[:, 0], emb_test[:, 1], s=3, marker=".", alpha=0.7, c="C0")
+    #     format_plot_axis(ax, xlim=(0, 1), ylim=(0, 1),
+    #                      xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #                      title=f"Bin {bin_id} — Test")
     #
-    #     # Train (family = fam)
     #     ax = axes[1]
-    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-    #                s=3, marker = ".", alpha=0.6, c="C0", zorder=1)
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Train — family {int(fam)}"
-    #     )
+    #     ax.scatter(emb_train[:, 0], emb_train[:, 1], s=3, marker=".", alpha=0.7, c="C0")
+    #     format_plot_axis(ax, xlim=(0, 1), ylim=(0, 1),
+    #                      xlabel="Latent dim 1", ylabel="Latent dim 2",
+    #                      title=f"Bin {bin_id} — Train")
     #
     #     plt.tight_layout()
-    #     plt.savefig(os.path.join(out_dir_fig, f"embeddings_family{int(fam)}_train_vs_test.png"),
+    #     plt.savefig(os.path.join(out_dir_fig, f"embeddings_train_test_bin{bin_id}.png"),
     #                 dpi=300, bbox_inches="tight")
-    #     plt.show();
     #     plt.close(fig)
+    #
+    # # --- embed per bin (train + test), still using embed_data ---
+    # onehots = {
+    #     0: torch.tensor([[1., 0., 0.]], device=device),
+    #     1: torch.tensor([[0., 1., 0.]], device=device),
+    #     2: torch.tensor([[0., 0., 1.]], device=device),
+    # }
+    #
+    # all_emb_tr, all_lab_tr, all_loc_tr = [], [], []
+    # all_emb_te, all_lab_te, all_loc_te = [], [], []
+    #
+    # # ---- helper for readable crosstabs ----
+    # def _crosstab_counts(a, b):
+    #     from collections import Counter
+    #     a = a.tolist() if hasattr(a, "tolist") else list(a)
+    #     b = b.tolist() if hasattr(b, "tolist") else list(b)
+    #     ct = Counter(zip(a, b))
+    #     rows = sorted(set(a))
+    #     cols = sorted(set(b))
+    #     return rows, cols, ct
+    #
+    #
+    # for b in (0, 1, 2):
+    #     c_b = onehots[b]
+    #
+    #     # TEST embeddings in the c=b slice
+    #     emb_te, lab_te = model.embed_data(
+    #         latent_grid.to(device),
+    #         test_bin_loaders[b],  # yields (spec, label) for bin b
+    #         binary_lp,
+    #         embed_type="rqmc",
+    #         n_samples=5,
+    #         c=c_b,  # key: evaluate on the proper conditional slice
+    #     )
+    #
+    #     # TRAIN embeddings in the same slice
+    #     emb_tr, lab_tr = model.embed_data(
+    #         latent_grid.to(device),
+    #         train_bin_loaders[b],
+    #         binary_lp,
+    #         embed_type="rqmc",
+    #         n_samples=5,
+    #         c=c_b,
+    #     )
+    #
+    #     # plot side-by-side for this bin
+    #     plot_bin_train_test(emb_tr, emb_te, b, out_dir_fig)
+    #
+    #     # ---- per-bin metadata slices (aligned with dataset order) ----
+    #     idx_tr_b = np.array(train_bin_to_idxs[b], dtype=int)
+    #     idx_te_b = np.array(test_bin_to_idxs[b], dtype=int)
+    #
+    #     loc_tr_b = _loc_bucketize(train_locs_all[idx_tr_b])
+    #     loc_te_b = _loc_bucketize(test_locs_all[idx_te_b])
+    #
+    #     # ---- SANITY CHECKS (before embedding plots) ----
+    #     print(f"\n[bin {b}] TRAIN uniques — families: {np.unique(lab_tr)}, locations: {np.unique(loc_tr_b)}")
+    #     rows, cols, ct = _crosstab_counts(lab_tr, loc_tr_b)
+    #     print(f"[bin {b}] TRAIN crosstab (family x location). cols={cols}")
+    #     for r in rows:
+    #         row = [ct.get((r, c), 0) for c in cols]
+    #         print(f"  fam {r}: {row}")
+    #
+    #     print(f"[bin {b}] TEST  uniques — families: {np.unique(lab_te)}, locations: {np.unique(loc_te_b)}")
+    #     rows, cols, ct = _crosstab_counts(lab_te, loc_te_b)
+    #     print(f"[bin {b}] TEST  crosstab (family x location). cols={cols}")
+    #     for r in rows:
+    #         row = [ct.get((r, c), 0) for c in cols]
+    #         print(f"  fam {r}: {row}")
+    #
+    #     # ---- per-bin triptychs: families (train & test) ----
+    #     plot_family_triptych(emb_tr, lab_tr, split_name="train", bin_id=b, out_dir=out_dir_fig)
+    #     plot_family_triptych(emb_te, lab_te, split_name="test", bin_id=b, out_dir=out_dir_fig)
+    #
+    #     # ---- per-bin triptychs: locations (train & test) ----
+    #     plot_location_triptych(emb_tr, loc_tr_b, split_name="train", bin_id=b, out_dir=out_dir_fig)
+    #     plot_location_triptych(emb_te, loc_te_b, split_name="test", bin_id=b, out_dir=out_dir_fig)
+    #
 
-    # =========================
-    # Plot - train/test seperately
-    # =========================
-    # import math
+
+    # -------------------------
+    # Plots
+    # -------------------------
     #
-    # def _grid_nrows_ncols(n, max_cols=4):
-    #     cols = min(n, max_cols)
-    #     rows = math.ceil(n / cols)
-    #     return rows, cols
     #
-    # families_present = sorted(np.unique(np.concatenate([train_labels, test_labels])))
-    # n = len(families_present)
-    # rows, cols = _grid_nrows_ncols(n, max_cols=4)
     #
-    # # ---------- TRAIN panels ----------
-    # fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), sharex=True, sharey=True)
-    # axes = np.atleast_2d(axes)
     #
-    # for idx, fam in enumerate(families_present):
-    #     r, c = divmod(idx, cols)
-    #     ax = axes[r, c]
-    #     m_tr = (train_labels == fam)
-    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-    #                s=3, marker=".", c="C0", alpha=0.6, linewidths=0)
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Train — family {int(fam)}"
+    # lin0 = model.decoder[0]  # Linear(in_features=4+3, out=64)
+    # W = lin0.weight.detach().cpu().numpy()  # [64, 7]
+    # W_basis = W[:, :4]  # for latent basis (2*latent_dim)
+    # W_c = W[:, 4:]  # for the 3 one-hot dims
+    #
+    #
+    # print("||W_basis||_F =", np.linalg.norm(W_basis))
+    # print("||W_c||_F     =", np.linalg.norm(W_c))
+    # print("rowwise ||W_c|| mean:", np.mean(np.linalg.norm(W_c, axis=1)))
+    #
+    # from data.bird_data import calc_mean_freq  # uses linear or  current weighting
+    #
+    #
+    # # define the helper *inside* main; decorator and def must have the same indent
+    # @torch.no_grad()
+    # def _grid_meanfreq_map(model, z_grid, c_onehot):
+    #     X = model(z_grid, random=False, mod=False, c=c_onehot)  # [K,1,H,W]
+    #     vals = []
+    #     for i in range(X.shape[0]):
+    #         spec = X[i, 0].detach().cpu().numpy()
+    #         # pass the frequency axis so the result is in Hz
+    #         vals.append(calc_mean_freq(spec, freq_axis=FREQ_AXIS))
+    #     return np.asarray(vals, dtype=np.float64)
+    #
+    # # ----- build the three maps -----
+    # device = model.decoder[0].weight.device
+    # z_grid = gen_fib_basis(m=15).to(device)
+    # Z = (z_grid % 1).detach().cpu().numpy()
+    #
+    # onehots = {
+    #     0: torch.tensor([[1., 0., 0.]], device=device),
+    #     1: torch.tensor([[0., 1., 0.]], device=device),
+    #     2: torch.tensor([[0., 0., 1.]], device=device),
+    # }
+    #
+    # m0 = _grid_meanfreq_map(model, z_grid, onehots[0])
+    # m1 = _grid_meanfreq_map(model, z_grid, onehots[1])
+    # m2 = _grid_meanfreq_map(model, z_grid, onehots[2])
+    #
+    # # plotting (shared colorbar)
+    # import matplotlib.colors as colors
+    # # after you have m0, m1, m2 in Hz
+    # vals_hz = [m0, m1, m2]
+    # vals_khz = [v / 1000.0 for v in vals_hz]
+    # titles = ["Bin 0 (<22 kHz)", "Bin 1 (22–25 kHz)", "Bin 2 (≥25 kHz)"]
+    #
+    # # shared color scale in kHz
+    # vmin_khz = min(map(np.min, vals_khz))
+    # vmax_khz = max(map(np.max, vals_khz))
+    # norm_khz = colors.Normalize(vmin=vmin_khz, vmax=vmax_khz)
+    # cmap = "viridis"
+    #
+    # fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharex=True, sharey=True)
+    # marker_size = 120
+    # alpha = 0.98
+    #
+    # for ax, v_khz, title in zip(axes, vals_khz, titles):
+    #     sc = ax.scatter(
+    #         Z[:, 0], Z[:, 1],
+    #         c=v_khz, s=marker_size, alpha=alpha,
+    #         cmap=cmap, norm=norm_khz,
+    #         edgecolors="none", linewidths=0,
+    #         rasterized=True
     #     )
+    #     ax.set_title(title)
+    #     ax.set_xlim(0, 1);
+    #     ax.set_ylim(0, 1)
+    #     ax.set_aspect("equal", "box")
+    #     ax.set_xticks([]);
+    #     ax.set_yticks([])
     #
-    # # hide any unused axes
-    # for j in range(n, rows * cols):
-    #     r, c = divmod(j, cols)
-    #     axes[r, c].axis("off")
+    # # colorbar from the last scatter; all share same norm/cmap so this is fine
+    # cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.92, pad=0.02)
+    # cbar.set_label("Mean frequency (kHz)")
     #
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(out_dir_fig, "embeddings_train_panels_by_family.png"),
-    #             dpi=300, bbox_inches="tight")
-    # plt.show();
-    # plt.close(fig)
-    #
-    # # ---------- TEST panels ----------
-    # fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), sharex=True, sharey=True)
-    # axes = np.atleast_2d(axes)
-    #
-    # for idx, fam in enumerate(families_present):
-    #     r, c = divmod(idx, cols)
-    #     ax = axes[r, c]
-    #     m_te = (test_labels == fam)
-    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-    #                s=3, marker=".", c="C0", alpha=0.6, linewidths=0)
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Test — family {int(fam)}"
-    #     )
-    #
-    # for j in range(n, rows * cols):
-    #     r, c = divmod(j, cols)
-    #     axes[r, c].axis("off")
-    #
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(out_dir_fig, "embeddings_test_panels_by_family.png"),
-    #             dpi=300, bbox_inches="tight")
-    # plt.show();
-    # plt.close(fig)
-    #
-    # # =========================
-    # # Plot - By location
-    # # =========================
-    # # Read locations from hdf5 files
-    # def _read_locations_for_file(h5_path):
-    #     with h5py.File(h5_path, 'r') as f:
-    #         locs = f['locations'][:]  # bytes array length = number of specs in this file
-    #     # decode bytes -> str
-    #     return np.array([x.decode('ASCII') for x in locs], dtype=object)
-    #
-    # def build_locations_vector(file_list):
-    #     """
-    #     Returns a 1D array of strings (arena_1/arena_2/underground) aligned
-    #     with the order bird_data/test_loader iterate (file-major, no shuffle).
-    #     """
-    #     out = []
-    #     for p in file_list:
-    #         out.extend(_read_locations_for_file(p))
-    #     return np.array(out, dtype=object)
-    #
-    # # locations
-    # train_locs = build_locations_vector(train_fns)  # shape = len(train_embeddings)
-    # test_locs = build_locations_vector(test_fns)  # shape = len(test_embeddings)
-    #
-    # #
-    # # plot - one family at one location (train vs test panels)
-    # def plot_family_location(fam, loc_name,
-    #                          train_embeddings, train_labels, train_locs,
-    #                          test_embeddings, test_labels, test_locs,
-    #                          out_dir_fig):
-    #     m_tr = (train_labels == fam) & (train_locs == loc_name)
-    #     m_te = (test_labels == fam) & (test_locs == loc_name)
-    #
-    #     fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
-    #
-    #     # Test
-    #     ax = axes[0]
-    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-    #                s=3, marker=".", alpha=0.7, c="C0")
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Test — family {int(fam)}, {loc_name}"
-    #     )
-    #
-    #     # Train
-    #     ax = axes[1]
-    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-    #                s=3, marker=".", alpha=0.7, c="C0")
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Train — family {int(fam)}, {loc_name}"
-    #     )
-    #
-    #     plt.tight_layout()
-    #     fn = os.path.join(out_dir_fig, f"embeddings_family{int(fam)}_{loc_name}_train_vs_test.png")
-    #     plt.savefig(fn, dpi=300, bbox_inches="tight")
-    #     plt.close(fig)
-    #
-    # for fam in sorted(np.unique(np.concatenate([train_labels, test_labels]))):
-    #     for loc in ["arena_1", "arena_2", "underground"]:
-    #         plot_family_location(fam, loc,
-    #                                  train_embeddings, train_labels, train_locs,
-    #                                  test_embeddings, test_labels, test_locs,
-    #                                  out_dir_fig)
-    #
-    # # plot - “all families pooled” but filtered to a single location
-    # def plot_all_families_at_location(loc_name,
-    #                                   train_embeddings, train_locs,
-    #                                   test_embeddings, test_locs,
-    #                                   out_dir_fig):
-    #     m_tr = (train_locs == loc_name)
-    #     m_te = (test_locs == loc_name)
-    #
-    #     fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharex=True, sharey=True)
-    #
-    #     # Test
-    #     ax = axes[0]
-    #     ax.scatter(test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-    #                s=3, marker=".", alpha=0.7, c="C0")
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Test — all families @ {loc_name}"
-    #     )
-    #
-    #     # Train
-    #     ax = axes[1]
-    #     ax.scatter(train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-    #                s=3, marker=".", alpha=0.7, c="C0")
-    #     ax = format_plot_axis(
-    #         ax, xlim=(0, 1), ylim=(0, 1),
-    #         xlabel="Latent dim 1", ylabel="Latent dim 2",
-    #         title=f"Train — all families @ {loc_name}"
-    #     )
-    #
-    #     plt.tight_layout()
-    #     fn = os.path.join(out_dir_fig, f"embeddings_allfamilies_{loc_name}_train_vs_test.png")
-    #     plt.savefig(fn, dpi=300, bbox_inches="tight")
-    #     plt.close(fig)
-    #
-    # for loc in ["arena_1", "arena_2", "underground"]:
-    #     plot_all_families_at_location(loc, train_embeddings, train_locs,
-    #                                   test_embeddings, test_locs,
-    #                                   out_dir_fig)
-    #
-    # # =========================
-    # Plot — embeddings over the decoded grid background
-    # (place this AFTER train/test embeddings are computed)
-    # =========================
-    # # same EPS as your visualize module uses
-    # EPS1 = 1e-15
-    # EPS2 = 1e-6
-    #
-    # def _embed_to_cell_idx(x, y, n, eps1=EPS1, eps2=EPS2):
-    #     # map [0,1] coords to a cell index matching "sample {i*n + j}"
-    #     u = np.clip((x - eps1) / max(1e-12, (1 - eps1 - eps2)), 0.0, 0.999999)
-    #     v = np.clip((y - eps1) / max(1e-12, (1 - eps1 - eps2)), 0.0, 0.999999)
-    #     i = int(u * n)  # column
-    #     j = int(v * n)  # row
-    #     return i * n + j
-    #
-    # def _overlay_embeddings_on_grid(fig, axes_map, emb_xy, n, dot="•", color="white"):
-    #     if emb_xy.size == 0:
-    #         return
-    #     idxs = [_embed_to_cell_idx(float(x), float(y), n) for x, y in emb_xy]
-    #     for idx in sorted(set(idxs)):
-    #         ax = axes_map.get(f"sample {idx}")
-    #         if ax is not None:
-    #             ax.text(0.92, 0.88, dot, transform=ax.transAxes,
-    #                     color=color, fontsize=10, fontweight="bold", zorder=10)
-    #
-    # GRID_N = 20
-    # emb_all = np.vstack([train_embeddings, test_embeddings])
-    #
-    # with torch.no_grad():
-    #     fig, axmap = model_grid_plot(
-    #         model,
-    #         n_samples_dim=GRID_N,
-    #         origin="lower",
-    #         cm="inferno",
-    #         show=False,
-    #         return_fig=True,  # <-- new
-    #     )
-    #
-    # _overlay_embeddings_on_grid(fig, axmap, emb_all, GRID_N, color="white")
-    # fig.suptitle("All families — usage over decoded latent grid", y=0.98, fontsize=14)
     # fig.tight_layout()
-    # fig.savefig(os.path.join(out_dir_fig, "overlay_allfamilies_on_grid.png"),
+    # plt.savefig(os.path.join(out_dir_fig, "meanfreq_scatter_bins_big_khz.png"),
     #             dpi=300, bbox_inches="tight")
     # plt.close(fig)
 
 
-# trial 2
-# --- Overlay on latent lattice (monochrome) ---
-# latent_bg = (latent_grid % 1).detach().cpu().numpy()
-#
-# for fam in sorted(np.unique(np.concatenate([train_labels, test_labels]))):
-#     m_tr = (train_labels == fam)
-#     m_te = (test_labels == fam)
-#
-#     fig, ax = plt.subplots(figsize=(5, 5))
-#     ax.set_facecolor("white")
-#
-#     # lattice: darker gray so white points pop
-#     ax.scatter(
-#         latent_bg[:, 0], latent_bg[:, 1],
-#         s=3, marker=".", c="0.6", alpha=1.0, linewidths=0, zorder=0
-#     )
-#
-#     # TEST: hollow white with black edge
-#     ax.scatter(
-#         test_embeddings[m_te, 0], test_embeddings[m_te, 1],
-#         s=10, facecolors="white", edgecolors="black", linewidths=0.6, zorder=2, label="test"
-#     )
-#
-#     # TRAIN: solid white with thin black edge
-#     ax.scatter(
-#         train_embeddings[m_tr, 0], train_embeddings[m_tr, 1],
-#         s=6, facecolors="white", edgecolors="black", linewidths=0.4, zorder=3, label="train"
-#     )
-#
-#     ax = format_plot_axis(
-#         ax, xlim=(0, 1), ylim=(0, 1),
-#         xlabel="Latent dim 1", ylabel="Latent dim 2",
-#         title=f"Family {int(fam)} — train/test over lattice (mono)"
-#     )
-#     ax.legend(frameon=False, loc="best")
-#
-#     plt.tight_layout()
-#     plt.savefig(os.path.join(out_dir_fig, f"embeddings_family{int(fam)}_over_grid_mono2.png"),
-#                 dpi=300, bbox_inches="tight")
-#     plt.show(); plt.close(fig)
-
-
-
-
-
-    # Old test plot:
-    # ax = plt.gca()
-    # ax.scatter(test_embeddings[:, 0], test_embeddings[:, 1], s=1, alpha=0.5)
-    # ax = format_plot_axis(
-    #     ax,
-    #     xlim=(0, 1),
-    #     ylim=(0, 1),
-    #     xlabel="Latent dim 1",
-    #     ylabel="Latent dim 2",
-    #     title="Latent embeddings of test dataset",
-    # )
-    # plt.show()
-    # plt.close()
-    #
-    # print(f"Saved eval outputs → {out_dir}")
-
-    ################################################################################
-    # Miles' plot code:
-    ################################################################################
-
-    # # both plots overlaid (train+test):
-    # ax = plt.gca()
-    #
-    # # Base layer: TRAIN (light gray, behind)
-    # ax.scatter(
-    #     train_embeddings[:, 0], train_embeddings[:, 1],
-    #     s=4, c="0.7", alpha=0.5, label="test", zorder=1
-    # )
-    #
-    # # Overlay: TEST (outlined points, on top)
-    # ax.scatter(
-    #     test_embeddings[:, 0], test_embeddings[:, 1],
-    #     s=8, facecolors="none", edgecolors="C3", linewidth=0.6,
-    #     label="train", zorder=2
-    # )
-    #
-    # ax = format_plot_axis(
-    #     ax,
-    #     xlim=(0, 1),
-    #     ylim=(0, 1),
-    #     xlabel="Latent dim 1",
-    #     ylabel="Latent dim 2",
-    #     title="Latent embeddings (train gray, test red)",
-    # )
-    #
-    # ax.legend(frameon=False, loc="best")
-    # plt.show()
-    # plt.close()
 
 
 if __name__ == "__main__":

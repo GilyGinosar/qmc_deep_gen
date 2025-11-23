@@ -44,8 +44,10 @@ def model_grid_plot(model,n_samples_dim,fn='',show=True,origin=None,cm='grey',mo
     for ii in range(n_samples):
         ax = axes[f"sample {ii}"]
         ax.imshow(sample[ii, 0, :, :], cmap=cm,origin=origin)
-        ax.spines[['right','left','top','bottom']].set_color(cmap(norm(ii)))
-        ax.spines[['right','left','top','bottom']].set_linewidth(4)
+        # ax.spines[['right','left','top','bottom']].set_color(cmap(norm(ii))) # the colorful frames
+        # ax.spines[['right','left','top','bottom']].set_linewidth(4)
+        ax.spines[['right', 'left', 'top', 'bottom']].set_color('white')
+        ax.spines[['right', 'left', 'top', 'bottom']].set_linewidth(2)
         ax.set_yticks([])
         ax.set_xticks([])
 
