@@ -219,7 +219,7 @@ def main():
         out_dir=out_dir
     )
 
-    # 6) quick eval on test split (same loss)
+    # 6) eval on test split (same loss)
     with torch.no_grad():
         _ = test_epoch(
             model,
