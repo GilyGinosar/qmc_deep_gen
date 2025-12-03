@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 # ==== project imports ====
 from data.bird_data import bird_data
-from models.sampling import gen_fib_basis          # latent grid for 2D
+from models.sampling import gen_fib_basis, gen_korobov_basis         # latent grid for 2D
 from models.utils import get_decoder_arch
 from models.qmc_base import QMCLVM
 from train.losses import binary_evidence, binary_lp
@@ -22,10 +22,10 @@ from train.train import train_loop, test_epoch
 # Config (edit to taste)
 # =========================
 ROOTS_PER_FAMILY = {
-    1: [r"D:\Data\235", r"D:\Data\237"],
-    2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"],
+    1: [r"D:\Data\Data_vae\235", r"D:\Data\Data_vae\237"],
+    #2: [r"D:\Data\113", r"D:\Data\114", r"D:\Data\115", r"D:\Data\116"],
 }
-FAMILIES       = [1, 2]      # which families to include
+FAMILIES       = [1]      # which families to include
 SPECS_PER_FILE = 100
 TEST_SIZE      = 0.20
 SPLIT_SEED     = 92
@@ -36,11 +36,16 @@ OUT_DIR_ROOT   = r"D:\data\model_checkpoints"
 COND           = False        # <--- ################### flip this
 CF             = "rule3_bands"  # only used if COND=True
 
-LATENT_DIM     = 2
+LATENT_DIM     = 3
+# Fibonacci 2D
 M_FIB          = 15          # latent grid density (Fibonacci)
+# Korobov 3D
+N_LATENT_POINTS = 1021  # or 2039, 4093
+a_korobov = 76
+
 N_EPOCHS       = 10          # training epochs
 
-# Batch size (keep small for conditional if memory is tight)
+# Batch size
 BATCH          = 1 if COND else 64
 
 
@@ -175,28 +180,34 @@ def main():
     if device.type == "cuda":
         print(f"[DEVICE] GPU: {torch.cuda.get_device_name(0)}")
 
-    # 1) data & loaders
+    # 1) build data loaders
     train_loader, test_loader, specs_per_file = build_datasets_and_loaders(
         ROOTS_PER_FAMILY, FAMILIES, SPECS_PER_FILE, BATCH, N_WORKERS, COND, CF
     )
 
-    # 2) model
+    # 2) build model (make_decoder)
     cond_dim = (3 if COND else 0)
     decoder = make_decoder(dataset_name="gerbil_ava", latent_dim=LATENT_DIM,
                            cond=COND, cond_dim=cond_dim)
     model = QMCLVM(latent_dim=LATENT_DIM, device=device, decoder=decoder)
 
-    # quick check
-    first_linear = None
-    for m in model.decoder.modules():
-        if isinstance(m, nn.Linear):
-            first_linear = m
-            break
-    if first_linear is not None:
-        print("[decoder[0]]", first_linear)
+    # sanity check - print first Linear layer
+    # first_linear = None
+    # for m in model.decoder.modules():
+    #     if isinstance(m, nn.Linear):
+    #         first_linear = m
+    #         break
+    # if first_linear is not None:
+    #     print("[decoder[0]]", first_linear)
 
-    # 3) training setup
-    latent_grid = gen_fib_basis(m=M_FIB)  # 2D grid
+    # print decoder
+    print("Decoder architecture, top-level layers:")
+    for i, layer in enumerate(model.decoder):
+        print(f"[{i}] {layer}")
+
+    # 3) training setup - latent grid (2D: Fiboncci; 3D: Korobov) + loss function
+    latent_grid = gen_korobov_basis(a=a_korobov,num_dims=LATENT_DIM,num_points=N_LATENT_POINTS).to(device).float()
+    # latent_grid = gen_fib_basis(m=M_FIB)  # 2D grid
     qmc_loss_func = binary_evidence
     qmc_lp        = binary_lp
 

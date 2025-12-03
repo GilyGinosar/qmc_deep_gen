@@ -45,16 +45,16 @@ def train_epoch(model,optimizer,loader,base_sequence,loss_function,random=True,m
         else:
             data, _ = batch
             data = data.to(model.device)
-            optimizer.zero_grad()
-            samples = model(base_sequence, random, mod)
+            optimizer.zero_grad() # reset
+            samples = model(base_sequence, random, mod) # forward pass -> likelihoods (negative log evidence)
 
         if len(importance_weights) == 0:
-            loss = loss_function(samples, data)
+            loss = loss_function(samples, data) # compute loss
         else:
             loss = loss_function(samples,data,importance_weights)
-        loss.backward()
+        loss.backward() # compute gradients
         train_loss += loss.item()
-        optimizer.step()
+        optimizer.step() # update parameters
         epoch_losses.append(loss.item())
 
     return epoch_losses,model,optimizer

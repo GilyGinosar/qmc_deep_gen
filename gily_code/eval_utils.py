@@ -18,8 +18,11 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from data.bird_data import bird_data
+
+
 
 # -----------------------
 # Generic helpers
@@ -56,7 +59,7 @@ def load_model_weights(model: torch.nn.Module, ckpt_path: str, device: torch.dev
     Loads full pickle, grabs model_state_dict if present, otherwise treats blob as state_dict.
     Returns (train_losses, epoch).
     """
-    blob = torch.load(ckpt_path, map_location="cpu")
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(blob, dict) and "model_state_dict" in blob:
         state = blob["model_state_dict"]
         train_losses = blob.get("losses", [])
@@ -397,3 +400,549 @@ def loc_bucketize(loc_str_array: np.ndarray) -> np.ndarray:
     s = np.char.lower(loc_str_array.astype(str))
     arena_mask = np.logical_or(np.char.find(s, "arena_1") >= 0, np.char.find(s, "arena_2") >= 0)
     return np.where(arena_mask, "arena", "underground")
+
+# Visualize
+# 3D
+
+@torch.no_grad()
+def plot_decoder_slices_3d(
+    model,
+    z3_values,
+    n_samples_dim=20,
+    device=None,
+    origin="lower",
+    cm="inferno",
+    show=False,
+    save_prefix=None,
+):
+    """
+    Visualize decoder cross-sections for a 3D latent space.
+
+    For each z3 in `z3_values`, this:
+      - builds an n_samples_dim x n_samples_dim grid over (z1, z2) in [0,1]^2
+      - fixes z3 = constant
+      - decodes all points
+      - tiles the decoded spectrograms into a big image
+      - optionally saves each slice as PNG
+
+    Args
+    ----
+    model : QMCLVM
+        Trained model with latent_dim = 3.
+    z3_values : list/tuple of float
+        Values in [0,1] at which to slice along the third latent dimension.
+    n_samples_dim : int
+        Number of points per axis for z1 and z2 grid.
+    device : torch.device or None
+        Device for computation; if None, uses model.device.
+    origin : {"lower","upper"}
+        Passed to imshow; "lower" means (0,0) at bottom-left.
+    cm : str
+        Matplotlib colormap name.
+    show : bool
+        Whether to call plt.show() at the end for each slice.
+    save_prefix : str or None
+        If not None, saves each slice as f"{save_prefix}_z3_{z3:.2f}.png".
+    """
+    if device is None:
+        device = model.device
+
+    model.eval()
+
+    # Latent grid over z1,z2 in [0,1]
+    lin = torch.linspace(0.0, 1.0, n_samples_dim)
+    Z1, Z2 = torch.meshgrid(lin, lin, indexing="ij")  # [n,n]
+
+    # We'll fill these per-slice
+    for z3 in z3_values:
+        # Build [K,3] grid: (z1,z2,z3_fixed)
+        K = n_samples_dim * n_samples_dim
+        z1_flat = Z1.reshape(-1)
+        z2_flat = Z2.reshape(-1)
+        z3_flat = torch.full_like(z1_flat, float(z3))
+
+        eval_grid = torch.stack([z1_flat, z2_flat, z3_flat], dim=1)  # [K,3]
+        eval_grid = eval_grid.to(device=device, dtype=torch.float32)
+
+        # Forward pass through QLVM decoder
+        # random=False, mod=False because we're specifying exact z in [0,1]^3
+        samples = model(eval_grid, random=False, mod=False)  # [K, C, H, W]
+
+        # Assume single-channel spectrograms: C=1
+        if samples.dim() != 4 or samples.shape[1] != 1:
+            raise ValueError(f"Expected decoder output [K,1,H,W], got {samples.shape}")
+
+        specs = samples[:, 0].cpu().numpy()  # [K, H, W], in [0,1] after sigmoid
+        K, H, W = specs.shape
+
+        # Build big tiled image: (n_samples_dim * H, n_samples_dim * W)
+        grid_img = np.zeros((n_samples_dim * H, n_samples_dim * W), dtype=np.float32)
+
+        for i in range(n_samples_dim):
+            for j in range(n_samples_dim):
+                idx = i * n_samples_dim + j
+                patch = specs[idx]  # [H,W]
+
+                # If origin="lower", we flip the vertical indexing so that
+                # low z2 is at bottom; adjust if you prefer opposite.
+                row = (n_samples_dim - 1 - i) if origin == "lower" else i
+
+                r0 = row * H
+                r1 = r0 + H
+                c0 = j * W
+                c1 = c0 + W
+
+                grid_img[r0:r1, c0:c1] = patch
+
+        # Plot
+        plt.figure(figsize=(6, 6))
+        plt.imshow(
+            grid_img,
+            cmap=cm,
+            origin=origin,
+            aspect="auto",
+        )
+        #plt.colorbar(label="decoder output (πθ)")
+        plt.title(f"Decoder slice at z3 = {z3:.2f}")
+        plt.axis("off")
+
+        if save_prefix is not None:
+            fn = f"{save_prefix}_z3_{z3:.2f}.png"
+            plt.savefig(fn, dpi=150, bbox_inches="tight")
+            print(f"[slice] wrote {fn}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+import torch
+import numpy as np
+from tqdm import tqdm
+
+def plot_latent_embedding(emb, labels, out_path, title="Test embeddings"):
+    """
+    Minimal plotting helper:
+      - If latent_dim = 2 → 2D scatter
+      - If latent_dim = 3 → 3D scatter
+    Colors by label if there is more than one unique label.
+    """
+    emb = np.asarray(emb)
+    labels = np.asarray(labels)
+
+    d = emb.shape[1]
+    uniq = np.unique(labels)
+
+    # simple color handling
+    if len(uniq) <= 1:
+        colors = "C0"
+    else:
+        cmap = plt.get_cmap("tab10")
+        color_map = {u: cmap(i % 10) for i, u in enumerate(uniq)}
+        colors = [color_map[l] for l in labels]
+
+    if d == 2:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        sc = ax.scatter(emb[:, 0], emb[:, 1], s=5, c=colors, alpha=0.8)
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("z₁")
+        ax.set_ylabel("z₂")
+        ax.set_title(title)
+        ax.set_aspect("equal", "box")
+
+        if len(uniq) > 1:
+            handles = []
+            for u in uniq:
+                handles.append(
+                    plt.Line2D([], [], marker="o", linestyle="",
+                               color=color_map[u], label=str(u), markersize=6)
+                )
+            ax.legend(handles=handles, frameon=False, title="label", loc="best")
+
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    elif d == 3:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111, projection="3d")
+
+        sc = ax.scatter(
+            emb[:, 0], emb[:, 1], emb[:, 2],
+            s=5, c=colors, alpha=0.7
+        )
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_zlim(0, 1)
+        ax.set_xlabel("z₁")
+        ax.set_ylabel("z₂")
+        ax.set_zlabel("z₃")
+        ax.set_title(title)
+
+        if len(uniq) > 1:
+            handles = []
+            for u in uniq:
+                handles.append(
+                    plt.Line2D([], [], marker="o", linestyle="",
+                               color=color_map[u], label=str(u), markersize=6)
+                )
+            ax.legend(handles=handles, frameon=False, title="label", loc="best")
+
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    else:
+        raise ValueError(f"Don't know how to plot latent_dim={d} (expected 2 or 3)")
+
+
+def compute_nll_and_energy(model, latent_grid, loader, loss_function):
+    device = model.device
+    latent_grid = latent_grid.to(device)
+
+    all_nll = []
+    all_energy = []
+
+    with torch.no_grad():
+        for data, _ in loader:
+            data = data.to(device).float()        # [B, C, H, W]
+            samples = model(latent_grid, random=True, mod=True)
+
+            # per-example NLL (same metric as training)
+            nll_batch = loss_function(
+                samples,
+                data,
+                reduce=False,
+                importance_weights=[]
+            )  # [B]
+
+            # per-example energy
+            energy_batch = (data ** 2).sum(dim=(1, 2, 3))  # [B]
+
+            all_nll.append(nll_batch.cpu().numpy())
+            all_energy.append(energy_batch.cpu().numpy())
+
+    all_nll = np.concatenate(all_nll, axis=0)
+    all_energy = np.concatenate(all_energy, axis=0)
+    return all_nll, all_energy
+
+
+def collect_examples_from_loader(loader, target_indices):
+    """
+    Collect original spectrograms (no recon) for given global indices.
+    Returns: array [Nsel, C, H, W]
+    """
+    target_indices = np.sort(np.array(target_indices))
+    target_set = set(target_indices.tolist())
+
+    collected = []
+    global_i = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            data, _ = batch
+            B = data.shape[0]
+
+            for j in range(B):
+                if global_i in target_set:
+                    collected.append(data[j].cpu().numpy())
+                global_i += 1
+
+    if len(collected) == 0:
+        return np.zeros((0,))
+    return np.stack(collected, axis=0)  # [Nsel, C, H, W]
+
+def plot_montage_100(originals, scores, out_path, title_prefix):
+    """
+    Plot up to 100 spectrograms in a 10x10 grid.
+    `scores` is per-example NLL; we annotate each tile with its value.
+    """
+    N = originals.shape[0]
+    n_show = min(100, N)
+
+    fig, axes = plt.subplots(10, 10, figsize=(12, 12))
+    for idx in range(n_show):
+        row, col = divmod(idx, 10)
+        ax = axes[row, col]
+
+        img = originals[idx]
+        # handle CxHxW or 1xHxW
+        if img.ndim == 3 and img.shape[0] == 1:
+            img = img[0]
+        elif img.ndim == 3 and img.shape[0] > 1:
+            # just take first channel
+            img = img[0]
+
+        ax.imshow(img, cmap="inferno", origin="lower", aspect="auto")
+        ax.axis("off")
+        ax.text(
+            0.01, 0.99,
+            f"{scores[idx]:.1f}",
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=6, color="white"
+        )
+
+    fig.suptitle(f"{title_prefix} — top {n_show}", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+# @torch.no_grad()
+# def compute_3d_embeddings(model, base_sequence, data_loader, device):
+#     """
+#     Compute 3D latent embeddings for each spectrogram in `data_loader`.
+#
+#     Returns:
+#         z_embeds: (N, 3) numpy array of posterior-mean latent coords
+#         labels:  (N,) numpy array of labels (if provided by dataset)
+#     """
+#     model.eval()
+#
+#     # base_sequence: [K, 3]
+#     base_seq = base_sequence.to(device).to(torch.float32)  # ensure on same device/dtype
+#
+#     # Precompute decoder output once: [K, C, H, W]
+#     samples = model(base_seq, random=False, mod=True)
+#
+#     all_z = []
+#     all_labels = []
+#
+#     for batch in tqdm(data_loader, desc="Embedding"):
+#         # data_loader yields (spec, label)
+#         if len(batch) == 2:
+#             x, labels = batch
+#         else:
+#             # Fallback if dataset only returns specs
+#             x = batch[0]
+#             labels = None
+#
+#         x = x.to(device)
+#
+#         # log p(x | z_j) for all z_j
+#         log_px_z = binary_lp(samples, x)  # shape: [B, K]
+#
+#         # posterior over z: softmax along K
+#         w = torch.softmax(log_px_z, dim=1)  # [B, K]
+#
+#         # posterior mean z: [B, K] @ [K, 3] = [B, 3]
+#         z_mean = w @ base_seq  # [B, 3]
+#
+#         all_z.append(z_mean.cpu().numpy())
+#         if labels is not None:
+#             all_labels.append(labels.cpu().numpy())
+#
+#     z_embeds = np.concatenate(all_z, axis=0)
+#     if all_labels:
+#         labels = np.concatenate(all_labels, axis=0)
+#     else:
+#         labels = None
+#
+#     return z_embeds, labels
+
+# R^2
+def compute_batch_r2(x, x_recon, var_eps=1e-6):
+    """
+    x, x_recon: [B, C, H, W]
+    Returns:
+        r2:  [B] numpy array of R^2 values
+        var: [B] numpy array of total variance per example (SS_tot)
+    """
+    B = x.shape[0]
+    # flatten per example
+    x_flat = x.view(B, -1)
+    xr_flat = x_recon.view(B, -1)
+
+    # residual sum of squares
+    ss_res = ((x_flat - xr_flat) ** 2).sum(dim=1)          # [B]
+
+    # total sum of squares (variance of x around its own mean)
+    x_mean = x_flat.mean(dim=1, keepdim=True)              # [B, 1]
+    ss_tot = ((x_flat - x_mean) ** 2).sum(dim=1)           # [B]
+
+    # R^2; set to NaN for near-zero variance
+    r2 = torch.empty_like(ss_tot)
+    valid = ss_tot > var_eps
+
+    r2[valid] = 1.0 - ss_res[valid] / ss_tot[valid]
+    r2[~valid] = torch.nan
+
+    return r2.cpu().numpy(), ss_tot.cpu().numpy()
+
+
+def compute_r2_over_loader(model, latent_grid, loader, log_likelihood, n_samples=5, c=[]):
+    """
+    For each example in `loader`, compute posterior-mean reconstruction
+    and its R^2 w.r.t. the true spectrogram.
+
+    Uses model.round_trip(..., recon_type='posterior').
+
+     Returns:
+      r2_all:   [N_examples] R^2 (NaN for near-constant / silent examples)
+      var_all:  [N_examples] total variance (SS_tot) per example
+    """
+    device = model.device
+    grid = latent_grid.to(device)
+
+    r2_list = []
+    var_list = []
+
+    with torch.no_grad():
+        for data, _ in loader:
+            data = data.to(device).float()  # [B,C,H,W]
+
+            recon = model.round_trip(
+                grid=grid,
+                data=data,
+                log_likelihood=log_likelihood,  # binary_lp
+                recon_type='posterior',
+                n_samples=n_samples,
+                c=c,
+            )  # [B,C,H,W]
+
+            r2_batch, var_batch = compute_batch_r2(data, recon)
+            r2_list.append(r2_batch)
+            var_list.append(var_batch)
+
+    r2_all = np.concatenate(r2_list, axis=0)
+    var_all = np.concatenate(var_list, axis=0)
+    return r2_all, var_all
+
+def collect_recons_from_loader(model, latent_grid, loader, target_indices, log_likelihood,
+                               n_samples=5, c=[]):
+    """
+    For the selected global indices (target_indices),
+    compute posterior-mean reconstructions.
+
+    Returns:
+        recons: array [Nsel, C, H, W]  of reconstructions
+    """
+    device = model.device
+    grid = latent_grid.to(device)
+
+    target_indices = np.sort(np.array(target_indices))
+    target_set = set(target_indices.tolist())
+
+    collected = []
+    global_i = 0
+
+    with torch.no_grad():
+        for data, _ in loader:
+            data = data.to(device).float()
+            B = data.shape[0]
+
+            # compute reconstructions for the whole batch
+            recon = model.round_trip(
+                grid=grid,
+                data=data,
+                log_likelihood=log_likelihood,
+                recon_type="posterior",
+                n_samples=n_samples,
+                c=c,
+            )  # [B,C,H,W]
+
+            # pick only those whose global index matches our target indices
+            for j in range(B):
+                if global_i in target_set:
+                    collected.append(recon[j].cpu().numpy())
+                global_i += 1
+
+    if len(collected) == 0:
+        return np.zeros((0,))
+    return np.stack(collected, axis=0)
+
+
+
+
+def plot_montage_pairs(true_specs, recon_specs, scores, out_path, title_prefix):
+    """
+    true_specs:  [N, C, H, W]
+    recon_specs: [N, C, H, W]
+    scores:      [N] (e.g. R^2)
+
+    Layout: 10 rows, 10 pairs per row.
+    Each pair is: [ real | recon | gap ] horizontally.
+    """
+    N = min(100, true_specs.shape[0])
+    n_rows = 10
+    n_pairs_per_row = 10
+    n_cols = n_pairs_per_row * 3  # real, recon, gap
+
+    # Make real/recon columns wide and gap columns narrow
+    width_ratios = []
+    for _ in range(n_pairs_per_row):
+        width_ratios.extend([1.0, 1.0, 0.25])  # real, recon, gap
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(22, 10),
+        gridspec_kw={"width_ratios": width_ratios, "wspace": 0.05, "hspace": 0.05},
+    )
+
+    # If axes comes back as 1D in some weird edge case, make sure it's 2D
+    if axes.ndim == 1:
+        axes = axes[None, :]
+
+    for k in range(N):
+        row = k // n_pairs_per_row
+        pair_idx = k % n_pairs_per_row
+
+        col_real  = 3 * pair_idx      # real image column
+        col_recon = col_real + 1      # recon image column
+        col_gap   = col_real + 2      # gap column (left unused)
+
+        # --- REAL ---
+        ax_real = axes[row, col_real]
+        img_real = true_specs[k, 0] if true_specs[k].ndim == 3 else true_specs[k]
+        ax_real.imshow(img_real, cmap="inferno", origin="lower", aspect="auto")
+        ax_real.axis("off")
+
+        # small "real" label
+        ax_real.text(
+            0.02, 0.02, "real",
+            transform=ax_real.transAxes,
+            ha="left", va="bottom",
+            fontsize=6, color="white",
+            bbox=dict(facecolor="black", alpha=0.4, pad=1, edgecolor="none"),
+        )
+
+        # --- RECON ---
+        ax_recon = axes[row, col_recon]
+        img_rec = recon_specs[k, 0] if recon_specs[k].ndim == 3 else recon_specs[k]
+        ax_recon.imshow(img_rec, cmap="inferno", origin="lower", aspect="auto")
+        ax_recon.axis("off")
+
+        # small "recon" label
+        ax_recon.text(
+            0.02, 0.02, "recon",
+            transform=ax_recon.transAxes,
+            ha="left", va="bottom",
+            fontsize=6, color="white",
+            bbox=dict(facecolor="black", alpha=0.4, pad=1, edgecolor="none"),
+        )
+
+        # R^2 (or whatever score) in the top-left of recon
+        ax_recon.text(
+            0.02, 0.98, f"{scores[k]:.2f}",
+            transform=ax_recon.transAxes,
+            ha="left", va="top",
+            fontsize=6, color="white",
+            bbox=dict(facecolor="black", alpha=0.4, pad=1, edgecolor="none"),
+        )
+
+        # --- GAP column ---
+        ax_gap = axes[row, col_gap]
+        ax_gap.axis("off")  # empty column -> visual horizontal spacing
+
+    fig.suptitle(f"{title_prefix}", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+

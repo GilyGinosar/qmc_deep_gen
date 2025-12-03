@@ -90,16 +90,16 @@ class QMCLVM(nn.Module):
 
     def forward(self, eval_grid,random=True,mod=True,c = []):
         """
-        eval_grid should be a sequence of `z`s that uniformly tile the latent space,
+        eval_grid base lattice - should be a sequence of `z`s that uniformly tile the latent space,
         and should be n_grid_points x latent_dim
         eval_grid: [n_grid_points, latent_dim] grid over latent space
         """
         
-
+        # random shift of grid points
         r = self.shift_function(1, self.latent_dim, device=self.device) if random else torch.zeros((1,self.latent_dim),device=self.device)
-        x = (r + eval_grid) % 1 if mod else r+eval_grid
+        x = (r + eval_grid) % 1 if mod else r+eval_grid # shift+ mod, the actual latent coordinates we'll use
 
-        basis = self.basis(x)
+        basis = self.basis(x) # torus basis
 
         # --- normalize shape of c to [1, cond_dim] and repeat to [K, cond_dim] ---
         if isinstance(c, torch.Tensor) and c.numel() > 0:
@@ -111,7 +111,7 @@ class QMCLVM(nn.Module):
             c_rep = c.repeat(basis.shape[0], 1)  # [K, cond_dim]
             basis = torch.cat([basis, c_rep], dim=-1)
 
-        return self.decoder(basis)
+        return self.decoder(basis) # run through the decoder
 
 
     def posterior_probability(self,grid,data,log_likelihood,c=[]):
@@ -219,7 +219,11 @@ class QMCLVM(nn.Module):
                     latent_batch = []
 
                     for _ in range(n_samples):
-                        tmp_grid = (grid + torch.rand((1,2),device=self.device))%1
+                        # 2D
+                        # tmp_grid = (grid + torch.rand((1,2),device=self.device))%1
+                        # 2D or 3D
+                        tmp_grid = (grid + torch.rand((1, grid.shape[1]), device=self.device)) % 1
+
                         posterior = self.posterior_probability(tmp_grid,data,log_likelihood,c=c) # Bsz x Grid size
                         latent_batch.append(self.basis.reverse(
                                             posterior.to(self.device) @ self.basis.forward(tmp_grid)

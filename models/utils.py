@@ -16,12 +16,12 @@ def get_decoder_arch(dataset_name,latent_dim,arch='qmc',n_per_sample=5,cond_dim=
 
     # Gily (for conditional)
     if arch == 'qmc':
-        in_dim = latent_dim * 2  # TorusBasis doubles features
+        in_dim = latent_dim * 2  # qmc_base.py\TorusBasis doubles features z--> [cos(2πz), sin(2πz)]
     elif arch == 'conditional_qmc':
         # if old code called without cond_dim, fall back to +1
         in_dim = latent_dim * 2 + (cond_dim if cond_dim else 1)
     else:
-        in_dim = latent_dim  # fallback (not used in your code paths)
+        in_dim = latent_dim  # fallback
     
     decoder.append(nn.Linear(latent_dim,2048))
 
