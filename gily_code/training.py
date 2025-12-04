@@ -33,17 +33,28 @@ N_WORKERS      = 0           # Win-safe; raise if Linux
 OUT_DIR_ROOT   = r"D:\data\model_checkpoints"
 
 # Toggle: conditional vs unconditional
-COND           = False        # <--- ################### flip this
-CF             = "rule3_bands"  # only used if COND=True
+COND           = True        # <--- ################### flip this
+CF             = "length"  # only used if COND=True
 
-LATENT_DIM     = 3
+if COND:
+    if CF == "rule3_bands":
+        cond_dim = 3 # 3-hot vector of frequency bins
+    elif CF == "length":
+        cond_dim = 1   # scalar duration
+    else:
+        raise ValueError(f"Unknown conditional_factor {CF}")
+else:
+    cond_dim = 0
+
+
+LATENT_DIM     = 2
 # Fibonacci 2D
 M_FIB          = 15          # latent grid density (Fibonacci)
 # Korobov 3D
 N_LATENT_POINTS = 1021  # or 2039, 4093
 a_korobov = 76
 
-N_EPOCHS       = 10          # training epochs
+N_EPOCHS       = 2          # training epochs
 
 # Batch size
 BATCH          = 1 if COND else 64
@@ -186,7 +197,6 @@ def main():
     )
 
     # 2) build model (make_decoder)
-    cond_dim = (3 if COND else 0)
     decoder = make_decoder(dataset_name="gerbil_ava", latent_dim=LATENT_DIM,
                            cond=COND, cond_dim=cond_dim)
     model = QMCLVM(latent_dim=LATENT_DIM, device=device, decoder=decoder)
@@ -205,9 +215,17 @@ def main():
     for i, layer in enumerate(model.decoder):
         print(f"[{i}] {layer}")
 
-    # 3) training setup - latent grid (2D: Fiboncci; 3D: Korobov) + loss function
-    latent_grid = gen_korobov_basis(a=a_korobov,num_dims=LATENT_DIM,num_points=N_LATENT_POINTS).to(device).float()
-    # latent_grid = gen_fib_basis(m=M_FIB)  # 2D grid
+    # 3) latent grid (2D: Fiboncci; 3D: Korobov) + loss function
+    if LATENT_DIM == 2:
+        latent_grid = gen_fib_basis(m=M_FIB).to(device).float()
+
+    elif LATENT_DIM == 3:
+        latent_grid = gen_korobov_basis(a=a_korobov,
+                                            num_dims=LATENT_DIM,
+                                            num_points=N_LATENT_POINTS).to(device).float()
+    else:
+            raise ValueError("Unconditional: LATENT_DIM must be 2 or 3 in this config.")
+
     qmc_loss_func = binary_evidence
     qmc_lp        = binary_lp
 

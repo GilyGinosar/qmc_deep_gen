@@ -53,6 +53,28 @@ class bird_data(Dataset):
         self.freq_axis = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ),
                                      int(NUM_FREQ_BINS), dtype=np.float64)
 
+        # Calculate length min and max for normalization
+        if self.conditional and self.conditional_factor == 'length':
+            self.min_dur = float('inf')
+            self.max_dur = 0.0
+
+            for fn in self.filenames:
+                with h5py.File(fn, 'r', locking=False) as f:
+                    on = f['onsets'][:]
+                    off = f['offsets'][:]
+                    durs = off - on  # shape (N,)
+
+                    if durs.size == 0:
+                        continue
+                    self.min_dur = min(self.min_dur, float(durs.min()))
+                    self.max_dur = max(self.max_dur, float(durs.max()))
+
+            # fallback if something went wrong
+            if not np.isfinite(self.min_dur) or self.max_dur <= self.min_dur:
+                print("[bird_data:length] WARNING: invalid duration range; using [0,1] as dummy.")
+                self.min_dur = 0.0
+                self.max_dur = 1.0
+
 
     def __len__(self):
         return len(self.filenames) * self.specs_per_file
@@ -72,17 +94,53 @@ class bird_data(Dataset):
                     c = calc_fm(spec)
                 elif self.conditional_factor == 'entropy':
                     c = calc_ent(spec)
+
+                # elif self.conditional_factor == 'length':
+                #     c = f['offsets'][spec_index] - f['onsets'][spec_index]
+
                 elif self.conditional_factor == 'length':
-                    c = f['offsets'][spec_index] - f['onsets'][spec_index]
+                    # raw duration (same units as in the HDF5 file)
+                    dur = f['offsets'][spec_index] - f['onsets'][spec_index]
+                    dur = float(dur)
+
+                    # --- DEBUG: print raw durations to understand units (samples? frames? sec?) ---
+                    if hasattr(self, "_debug_len_count"):
+                        pass
+                    else:
+                        self._debug_len_count = 0
+
+                    if self._debug_len_count < 5:  # print only the first few
+                        print(f"[DEBUG length] raw dur = {dur}")
+                        print(f"  offset = {float(f['offsets'][spec_index])}")
+                        print(f"  onset  = {float(f['onsets'][spec_index])}")
+                        self._debug_len_count += 1
+                    # ------------------------------------------------------------------------------
+
+                    # normalize to [0,1] using dataset-wide min/max computed in __init__
+                    rng = self.max_dur - self.min_dur
+                    if rng <= 0:
+                        dur_norm = 0  # degenerate fallback
+                    else:
+                        dur_norm = (dur - self.min_dur) / (rng + 1e-8)
+                        dur_norm = float(np.clip(dur_norm, 0.0, 1.0))
+
+                    # scalar tensor [1], compatible with cond_dim = 1
+                    c = torch.tensor([dur_norm], dtype=torch.float32)
+
+
+
+
+
                 elif self.conditional_factor == 'locations':
                     # analysis only (NOT for training)
                     c = f['locations'][spec_index].decode('ASCII')
+
                 elif self.conditional_factor == 'file':
                     # analysis only (NOT for training)
                     c = f['audio_filenames'][spec_index].decode('ASCII')
 
-                elif self.conditional_factor == 'mean_freq':
-                    c = calc_mean_freq(spec)
+                # elif self.conditional_factor == 'mean_freq':
+                #     c = calc_mean_freq(spec)
 
 
                 # ---- NEW one-hot binning (Option A: uses self.k22/self.k29 precomputed in __init__) ----
@@ -93,13 +151,13 @@ class bird_data(Dataset):
                 #     # generic: choose estimator name via attribute or hardcode here
                 #     c = one_hot_bin1h(spec, self.freq_axis, estimator="median50", edges_hz=self.edges_hz)
 
-                elif self.conditional_factor == 'framecount':
-                    onehot, _ = framecount_mid_priority_bin(spec, self.freq_axis,
-                                                            edges_hz=self.edges_hz,
-                                                            use_ambiguous=False)
-                    c = onehot  # 1-hot np.float32
-                elif self.conditional_factor == 'framecount_argmax':
-                    c = framecount_argmax_bin(spec, self.freq_axis, edges_hz=self.edges_hz)
+                # elif self.conditional_factor == 'framecount':
+                #     onehot, _ = framecount_mid_priority_bin(spec, self.freq_axis,
+                #                                             edges_hz=self.edges_hz,
+                #                                             use_ambiguous=False)
+                #     c = onehot  # 1-hot np.float32
+                # elif self.conditional_factor == 'framecount_argmax':
+                #     c = framecount_argmax_bin(spec, self.freq_axis, edges_hz=self.edges_hz)
 
                 elif self.conditional_factor == 'rule3_bands':
                     # spec: (F, T) numpy-like
