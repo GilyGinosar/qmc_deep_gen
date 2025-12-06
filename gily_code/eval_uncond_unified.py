@@ -19,7 +19,7 @@ from models.qmc_base import QMCLVM
 from models.sampling import gen_fib_basis, gen_korobov_basis
 from models.utils import get_decoder_arch
 from plotting.visualize import qmc_train_plot #, model_grid_plot
-from plotting.visualize_3d import model_grid_plot
+from plotting.visualize_3d import model_grid_plot # 3D version
 
 from train.losses import binary_evidence, binary_lp
 from train.train import test_epoch
