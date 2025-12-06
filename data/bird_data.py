@@ -103,18 +103,6 @@ class bird_data(Dataset):
                     dur = f['offsets'][spec_index] - f['onsets'][spec_index]
                     dur = float(dur)
 
-                    # --- DEBUG: print raw durations to understand units (samples? frames? sec?) ---
-                    if hasattr(self, "_debug_len_count"):
-                        pass
-                    else:
-                        self._debug_len_count = 0
-
-                    if self._debug_len_count < 5:  # print only the first few
-                        print(f"[DEBUG length] raw dur = {dur}")
-                        print(f"  offset = {float(f['offsets'][spec_index])}")
-                        print(f"  onset  = {float(f['onsets'][spec_index])}")
-                        self._debug_len_count += 1
-                    # ------------------------------------------------------------------------------
 
                     # normalize to [0,1] using dataset-wide min/max computed in __init__
                     rng = self.max_dur - self.min_dur
