@@ -946,3 +946,24 @@ def plot_montage_pairs(true_specs, recon_specs, scores, out_path, title_prefix):
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+## stuff for reading hdf5 keys
+def _loc_bucketize(loc_str_array: np.ndarray) -> np.ndarray:
+    s = np.char.lower(loc_str_array.astype(str))
+    arena_mask = np.logical_or(np.char.find(s, "arena_1") >= 0,
+                               np.char.find(s, "arena_2") >= 0)
+    return np.where(arena_mask, "arena", "underground")
+
+# plot
+def plot_by_location(emb_xy: np.ndarray, loc_bucket: np.ndarray, split_name: str, out_dir: str):
+    fig, ax = plt.subplots(figsize=(6.2, 6.0))
+    for name, col in [("arena", "C0"), ("underground", "C3")]:
+        m = (loc_bucket == name)
+        ax.scatter(emb_xy[m, 0], emb_xy[m, 1], s=6, marker=".", alpha=0.85, c=col, label=name)
+    format_plot_axis(ax, xlim=(0,1), ylim=(0,1),
+                     xlabel="Latent dim 1", ylabel="Latent dim 2",
+                     title=f"(Unconditional) Embeddings by location — {split_name}")
+    ax.legend(frameon=False, loc="best", markerscale=1.5)
+    plt.tight_layout()
+    fn = os.path.join(out_dir, f"embeddings_uncond_by_location_{split_name}.png")
+    plt.savefig(fn, dpi=300, bbox_inches="tight")
+    plt.close(fig)

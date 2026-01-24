@@ -92,6 +92,12 @@ class bird_data(Dataset):
             if self.conditional:
                 if self.conditional_factor == 'fm':
                     c = calc_fm(spec)
+
+                elif self.conditional_factor == 'fm_scalar':
+                    raw_fm = calc_fm(spec)  # float
+                    fm_norm = normalize_fm_scalar(raw_fm)  # float in [-1, 1]
+                    c = torch.tensor([fm_norm], dtype=torch.float32)
+
                 elif self.conditional_factor == 'entropy':
                     c = calc_ent(spec)
 
@@ -147,23 +153,23 @@ class bird_data(Dataset):
                 # elif self.conditional_factor == 'framecount_argmax':
                 #     c = framecount_argmax_bin(spec, self.freq_axis, edges_hz=self.edges_hz)
 
-                elif self.conditional_factor == 'rule3_bands':
-                    # spec: (F, T) numpy-like
-                    S = np.asarray(spec, dtype=np.float64)
-                    F = S.shape[0]
-
-                    # Build a freq axis in **kHz** to match the classifier’s expectation.
-                    # Use your fixed grid, but adapt if F != NUM_FREQ_BINS just in case.
-                    f_hz = self.freq_axis
-                    if f_hz.shape[0] != F:
-                        f_hz = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ), F, dtype=np.float64)
-                    freqs_khz = f_hz / 1000.0
-
-                    # Run your rule-based classifier (already imported at top)
-                    label, _diag = classify_spectrogram_three_way(S, freqs_khz)
-
-                    # One-hot torch tensor [3]: low=0, alarm=1, high=2
-                    c = _onehot3_from_label(label)
+                # elif self.conditional_factor == 'rule3_bands':
+                #     # spec: (F, T) numpy-like
+                #     S = np.asarray(spec, dtype=np.float64)
+                #     F = S.shape[0]
+                #
+                #     # Build a freq axis in **kHz** to match the classifier’s expectation.
+                #     # Use your fixed grid, but adapt if F != NUM_FREQ_BINS just in case.
+                #     f_hz = self.freq_axis
+                #     if f_hz.shape[0] != F:
+                #         f_hz = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ), F, dtype=np.float64)
+                #     freqs_khz = f_hz / 1000.0
+                #
+                #     # Run your rule-based classifier (already imported at top)
+                #     label, _diag = classify_spectrogram_three_way(S, freqs_khz)
+                #
+                #     # One-hot torch tensor [3]: low=0, alarm=1, high=2
+                #     c = _onehot3_from_label(label)
 
                 else:
                     raise NotImplementedError
@@ -253,11 +259,57 @@ def calc_fm(spec):
     dt2 = np.amax(dt**2,axis=0)
     df2 = np.amax(df**2,axis=0)
     fm =np.arctan(dt2,df2[:-1])
+
     weights = (np.sum(spec,axis=0) > 0).astype(np.float32)[:-1]
-    weights /= np.sum(weights)
-    return (fm * weights).sum()
+    w_sum = np.sum(weights)
+
+
+    if w_sum <=0:
+        return np.nan
+
+    weights /= w_sum
+    return float((fm * weights).sum())
+
 
 # Gily's addition
+# ---- FM scalar normalization ----
+# do this offline:
+# paths = glob.glob("D:/Data/Data_vae/235/processed-data/family1/*.hdf5")[:50]
+# vals = []
+#
+# for fn in paths:
+#     with h5py.File(fn, "r") as f:
+#         specs = f["specs"]
+#         for i in range(20):     # sample 20 per file
+#             v = float(calc_fm(specs[i]))
+#             vals.append(v)
+#
+#
+# fm_vals = np.array(vals, dtype=np.float64)
+#
+# print("Total FM values:", len(fm_vals))
+# print("Finite FM values:", np.isfinite(fm_vals).sum())
+#
+# print("FM raw median =", np.nanmedian(fm_vals))
+# print("FM raw 95pct  =", np.nanpercentile(fm_vals, 95))
+
+_FM_MEDIAN   = 0.1075445891432642 #calc offline
+_FM_P95      = 0.37692881603987494
+_FM_SCALE95  = max(_FM_P95 - _FM_MEDIAN, 1e-6)
+
+def normalize_fm_scalar(fm: float) -> float:
+    """
+    Map raw calc_fm(spec) -> normalized scalar in [-1, 1].
+    """
+    if not np.isfinite(fm):
+        return 0.0
+    z = (fm - _FM_MEDIAN) / _FM_SCALE95
+    z = np.clip(z, -1.0, 1.0)
+    return float(z)
+
+
+
+
 
 _EPS = 1e-10
 

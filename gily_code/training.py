@@ -34,12 +34,12 @@ OUT_DIR_ROOT   = r"D:\data\model_checkpoints"
 
 # Toggle: conditional vs unconditional
 COND           = True        # <--- ################### flip this
-CF             = "length"  # only used if COND=True
+CF             = "fm_scalar"  # only used if COND=True
 
 if COND:
     if CF == "rule3_bands":
         cond_dim = 3 # 3-hot vector of frequency bins
-    elif CF == "length":
+    elif CF == "fm_scalar":
         cond_dim = 1   # scalar duration
     else:
         raise ValueError(f"Unknown conditional_factor {CF}")
