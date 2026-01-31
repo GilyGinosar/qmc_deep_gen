@@ -1,4 +1,5 @@
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 import os,glob
 import h5py
 from sklearn.model_selection import train_test_split
@@ -40,7 +41,7 @@ def load_segmented_sylls(bird_filepath,sylls,test_size=0.2,seed=92):
 
 class bird_data(Dataset):
 
-    def __init__(self,filenames,syll_ids,specs_per_file=20,transform=spec_to_tensor,
+    def __init__(self,filenames,syll_ids,specs_per_file=20,transform=transforms.ToTensor(),
                  conditional=False,conditional_factor='fm'):
 
 
@@ -81,12 +82,13 @@ class bird_data(Dataset):
 
 
     def __getitem__(self,index):
-        load_index = index // self.specs_per_file
-        spec_index = index % self.specs_per_file
+
+        load_index = index//self.specs_per_file
+        spec_index = index%self.specs_per_file
         load_fn = self.filenames[load_index]
         syll_id = self.syll_ids[load_index]
-
-        with h5py.File(load_fn, 'r', locking=False) as f:
+        
+        with h5py.File(load_fn,'r',locking=False) as f:
             spec = f['specs'][spec_index]
 
             if self.conditional:
@@ -126,61 +128,86 @@ class bird_data(Dataset):
 
 
                 elif self.conditional_factor == 'locations':
-                    # analysis only (NOT for training)
+                    ### this should ONLY be used for analysis and NOT for training
+        
                     c = f['locations'][spec_index].decode('ASCII')
-
                 elif self.conditional_factor == 'file':
-                    # analysis only (NOT for training)
+                    ### this should ALSO only be used for analysis and NOT for training
                     c = f['audio_filenames'][spec_index].decode('ASCII')
-
-                # elif self.conditional_factor == 'mean_freq':
-                #     c = calc_mean_freq(spec)
-
-
-                # ---- NEW one-hot binning (Option A: uses self.k22/self.k29 precomputed in __init__) ----
-                # elif self.conditional_factor == 'mean_freq_bin1h':
-                #     spec_np = np.array(spec, copy=False)
-                #     c = calc_mean_freq_bin1h(spec_np, self.freq_axis)  # returns (3,) float32
-                # elif self.conditional_factor == 'freq_bin1h':
-                #     # generic: choose estimator name via attribute or hardcode here
-                #     c = one_hot_bin1h(spec, self.freq_axis, estimator="median50", edges_hz=self.edges_hz)
-
-                # elif self.conditional_factor == 'framecount':
-                #     onehot, _ = framecount_mid_priority_bin(spec, self.freq_axis,
-                #                                             edges_hz=self.edges_hz,
-                #                                             use_ambiguous=False)
-                #     c = onehot  # 1-hot np.float32
-                # elif self.conditional_factor == 'framecount_argmax':
-                #     c = framecount_argmax_bin(spec, self.freq_axis, edges_hz=self.edges_hz)
-
-                # elif self.conditional_factor == 'rule3_bands':
-                #     # spec: (F, T) numpy-like
-                #     S = np.asarray(spec, dtype=np.float64)
-                #     F = S.shape[0]
-                #
-                #     # Build a freq axis in **kHz** to match the classifier’s expectation.
-                #     # Use your fixed grid, but adapt if F != NUM_FREQ_BINS just in case.
-                #     f_hz = self.freq_axis
-                #     if f_hz.shape[0] != F:
-                #         f_hz = np.linspace(float(MIN_FREQ_HZ), float(MAX_FREQ_HZ), F, dtype=np.float64)
-                #     freqs_khz = f_hz / 1000.0
-                #
-                #     # Run your rule-based classifier (already imported at top)
-                #     label, _diag = classify_spectrogram_three_way(S, freqs_khz)
-                #
-                #     # One-hot torch tensor [3]: low=0, alarm=1, high=2
-                #     c = _onehot3_from_label(label)
-
                 else:
                     raise NotImplementedError
+        
+        
+        spec = self.transform(spec)
+
+        if self.conditional:
+            return (spec,c,syll_id)
+        return (spec,syll_id)
+
+class hdf5_data_general(Dataset):
+
+    def __init__(self,filenames,syll_ids,transform=transforms.ToTensor(),
+                 conditional=False,conditional_factor='fm'):
+
+        self.filenames=filenames
+        self.syll_ids = syll_ids
+        self.transform = transform
+        self.conditional=conditional
+        self.conditional_factor = conditional_factor
+        total, file_lens = self._get_len()
+
+        self.length = total
+        self.cumulative_file_nums = np.cumsum(file_lens).astype(np.int32)
+
+    def _get_len(self):
+
+        file_lens = []
+        for fn in self.filenames:
+            with h5py.File(fn,'r',locking=False) as f:
+                file_lens.append(f['num_specs'])
+
+        total_len = np.sum(file_lens)
+
+        return total_len,file_lens
+
+    def __len__(self):
+        return self.length
+
+
+    def __getitem__(self,index):
+
+        load_index = np.argwhere(self.cumulative_file_nums >= index)[0].squeeze()
+        spec_index = index - load_index
+        load_fn = self.filenames[load_index]
+        syll_id = self.syll_ids[load_index]
+
+        with h5py.File(load_fn,'r',locking=False) as f:
+            spec = f['specs'][spec_index]
+
+            if self.conditional:
+                if self.conditional_factor == 'fm':
+                    c = calc_fm(spec)
+                elif self.conditional_factor == 'entropy':
+                    c = calc_ent(spec)
+                elif self.conditional_factor =='length':
+                    c = f['offsets'][spec_index] - f['onsets'][spec_index]
+                elif self.conditional_factor == 'locations':
+                    ### this should ONLY be used for analysis and NOT for training
+
+                    c = f['locations'][spec_index].decode('ASCII')
+                elif self.conditional_factor == 'file':
+                    ### this should ALSO only be used for analysis and NOT for training
+                    c = f['audio_filenames'][spec_index].decode('ASCII')
+                else:
+                    raise NotImplementedError
+
 
         spec = self.transform(spec)
 
         if self.conditional:
-            return (spec, c, syll_id)
-        return (spec, syll_id)
+            return (spec,c,syll_id)
+        return (spec,syll_id)
 
-    
 def load_gerbils(gerbil_filepath,families=[2],test_size=0.2,seed=92,check=True):
 
     specs_per_file = 100
@@ -259,7 +286,6 @@ def calc_fm(spec):
     dt2 = np.amax(dt**2,axis=0)
     df2 = np.amax(df**2,axis=0)
     fm =np.arctan(dt2,df2[:-1])
-
     weights = (np.sum(spec,axis=0) > 0).astype(np.float32)[:-1]
     w_sum = np.sum(weights)
 

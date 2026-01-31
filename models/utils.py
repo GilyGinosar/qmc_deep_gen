@@ -25,15 +25,28 @@ def get_decoder_arch(dataset_name,latent_dim,arch='qmc',n_per_sample=5,cond_dim=
     
     decoder.append(nn.Linear(latent_dim,2048))
 
-    if 'mnist_simple' in dataset_name.lower():
+    if ('mnist_simple' in dataset_name.lower()) or ('binarized_mnist' in dataset_name.lower()):
         print("getting SHRIMPLE decoder")
         decoder = nn.Sequential(nn.Linear(latent_dim,500))
         layers = [
-                nn.ReLU(),
+                nn.Tanh(),
                 nn.Linear(500,28**2),
                 nn.Sigmoid(),
                 nn.Unflatten(1,(1,28,28))
         ]
+
+    elif 'mnist_iterative_comparison' in dataset_name.lower():
+
+        decoder = nn.Sequential(nn.Linear(latent_dim,512))
+        layers = [
+            nn.ELU(),
+            nn.Linear(512,512),
+            nn.ELU(),
+            nn.Linear(512,28**2),
+            nn.Sigmoid(),
+            nn.Unflatten(1,(1,28,28))
+        ]
+
     elif 'mnist' in dataset_name.lower():
 
         layers = [nn.ReLU(),
@@ -293,16 +306,15 @@ def get_encoder_arch(dataset_name,latent_dim,n_per_sample=5,diag=False):
 
     if 'mnist_simple' in dataset_name.lower():
         print("getting SHRIMPLE encoder")
-        encoder_net = nn.Flatten(start_dim=1,end_dim=-1)
-        mu_net = nn.Sequential(nn.Linear(28**2,500),
-                               nn.ReLU(),
-                               nn.Linear(500,latent_dim))
-        L_net = ZeroLayer(28**2,latent_dim)
-        d_net = nn.Sequential(nn.Linear(28**2,500),
-                               nn.ReLU(),
-                               nn.Linear(500,latent_dim))
+        encoder_net = nn.Sequential(nn.Flatten(start_dim=1,end_dim=-1),
+                                    nn.Linear(28**2,500),
+                                    nn.Tanh())
+        mu_net = nn.Linear(500,latent_dim)
+        L_net = ZeroLayer(500,latent_dim)
+        d_net = nn.Linear(500,latent_dim)
         enc = Encoder(net=encoder_net,mu_net=mu_net,l_net=L_net,d_net=d_net,latent_dim=latent_dim)
         #print(list(enc.named_parameters()))
+        
     elif 'mnist' in dataset_name.lower():
 
         encoder_net =nn.Sequential(nn.Conv2d(1,16,1),

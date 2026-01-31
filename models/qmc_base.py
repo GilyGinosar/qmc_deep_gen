@@ -52,6 +52,24 @@ class TorusBasis(nn.Module):
 
         return angles/(2*torch.pi)
 
+class GaussianICDFBasis(nn.Module):
+
+    def __init__(self,device='cuda'):
+
+        super(GaussianICDFBasis,self).__init__()
+        self.device=device
+        self.dist = torch.distributions.Normal(torch.tensor([[0.,]],device=device),torch.tensor([[1.,]],device=device))
+        self.icdf = lambda x: self.dist.icdf(torch.clip(x,min=1e-4,max=1-1e-4))
+        self.cdf = self.dist.cdf
+
+    def forward(self,data):
+
+        return self.icdf(data)
+
+    def reverse(self,data):
+
+        return self.cdf(data)
+
 class IdentityBasis(nn.Module):
 
     def __init__(self):
@@ -114,6 +132,7 @@ class QMCLVM(nn.Module):
         return self.decoder(basis) # run through the decoder
 
 
+    ######### Fix this
     def posterior_probability(self,grid,data,log_likelihood,c=[]):
 
         """
@@ -128,12 +147,15 @@ class QMCLVM(nn.Module):
             if len(c) > 0:
                 basis = torch.cat([basis,c.repeat(basis.shape[0],1)],axis=-1)
             preds = self.decoder(basis)
-    
+
+            #model_lattice_lls = []
+
             model_grid_lls = log_likelihood(preds,data) #each entry A_ij is log p(x_i|z_j)
                 
             ## as such, model_Grid_array should be n_data x n_grid points
             #ll_per_grid = model_grid_lls.sum(dim=0)
-            evidence = torch.special.logsumexp(model_grid_lls,dim=1,keepdims=True) ## n_data x 1
+            evidence = torch.special.logsumexp(model_grid_lls,dim=1,keepdims=True)- np.log(len(basis)) ## n_data x 1
+            #evidence = torch.special.logsumexp(model_lattice_lls,dim=1,keepdims=True) - np.log(len(basis)) ## n_data x 1
             
             posterior = model_grid_lls - evidence
 
@@ -219,11 +241,7 @@ class QMCLVM(nn.Module):
                     latent_batch = []
 
                     for _ in range(n_samples):
-                        # 2D
-                        # tmp_grid = (grid + torch.rand((1,2),device=self.device))%1
-                        # 2D or 3D
-                        tmp_grid = (grid + torch.rand((1, grid.shape[1]), device=self.device)) % 1
-
+                        tmp_grid = (grid + torch.rand((1,2),device=self.device))%1
                         posterior = self.posterior_probability(tmp_grid,data,log_likelihood,c=c) # Bsz x Grid size
                         latent_batch.append(self.basis.reverse(
                                             posterior.to(self.device) @ self.basis.forward(tmp_grid)
