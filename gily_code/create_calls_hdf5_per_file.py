@@ -12,6 +12,8 @@ from gily_code.ava_utils import get_spec
 from ava.preprocessing.preprocess import get_syll_specs
 from gily_code.clean_audio import apply_zonal_cleaning
 
+# This version cleans all calls regardless of call type
+
 ### ---------------- Paths and parameters ----------------
 exp = 237
 
