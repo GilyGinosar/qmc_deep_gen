@@ -12,16 +12,14 @@ from gily_code.ava_utils import get_spec
 from ava.preprocessing.preprocess import get_syll_specs
 from gily_code.clean_audio import apply_zonal_cleaning
 
-# This version cleans all calls regardless of call type
-
 ### ---------------- Paths and parameters ----------------
 exp = 237
 
 data_path = fr"\\sanesstorage.cns.nyu.edu\archive\ginosar\Processed_data\Audio\{exp}"
 print(data_path)
-onoffpath = os.path.join(data_path, "vox_for_Miles.csv")
+onoffpath = os.path.join(data_path, "vox_for_qlvm.csv")
 wavpath = os.path.join(data_path, "Averaged_wavs_w_annotations")
-specpath = os.path.join(data_path, "processed-data/family1_31_1_B_per_file")
+specpath = os.path.join(data_path, "processed-data/Clean_by_call_type")
 
 Path(specpath).mkdir(parents=True, exist_ok=True)
 
@@ -63,7 +61,7 @@ MASK_CONTEXT_SEC = 2.0  # window used for mask calculation
 SAVE_WINDOW_SEC = 0.3   # final window saved to HDF5
 BUFFER_SEC = 0.02       # 20ms padding around the actual call
 MIN_CTX_SAMPLES = 1024  # skip tiny contexts
-USE_CLEANING = False     # set False to bypass apply_zonal_cleaning
+CLEAN_EVENT_TYPES = {"warble", "ufm", "hat", "tilda"}
 
 grouped = voc_data.groupby("file_num")
 
@@ -103,8 +101,11 @@ for file_num, df_file in tqdm(grouped, total=len(grouped)):
             audio = audio.mean(axis=1)
         total_dur = len(audio) / fs
 
-        for onset, offset, loc in zip(
-            df_chan.start_time_file_sec, df_chan.stop_time_file_sec, df_chan.assigned_location
+        for onset, offset, loc, event_type in zip(
+            df_chan.start_time_file_sec,
+            df_chan.stop_time_file_sec,
+            df_chan.assigned_location,
+            df_chan["event-type"],
         ):
             # -- 1. Gatekeeper: Skip Edge Calls
             midpoint = (onset + offset) / 2
@@ -131,7 +132,8 @@ for file_num, df_file in tqdm(grouped, total=len(grouped)):
                 stats["flat_ctx"] += 1
                 continue
             ctx_norm = (spec_db - spec_db.min()) / denom
-            if USE_CLEANING:
+            event_key = str(event_type).strip().lower()
+            if event_key in CLEAN_EVENT_TYPES:
                 try:
                     mask_ctx = apply_zonal_cleaning(ctx_norm, fs)
                 except Exception as e:
