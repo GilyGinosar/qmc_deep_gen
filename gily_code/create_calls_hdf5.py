@@ -14,13 +14,13 @@ from ava.preprocessing.preprocess import get_syll_specs
 from gily_code.clean_audio import apply_zonal_cleaning
 
 ### ---------------- Paths and parameters ----------------
-exp = 235
+exp = 237
 
 data_path = fr"\\sanesstorage.cns.nyu.edu\archive\ginosar\Processed_data\Audio\{exp}" #'/mnt/home/mmartinez/ceph/data/gerbil/gily'
 print(data_path)
 onoffpath = os.path.join(data_path,'vox_for_Miles.csv')
 wavpath = os.path.join(data_path,'Averaged_wavs_w_annotations') #'audio')
-specpath = os.path.join(data_path,'processed-data/family1_25_1_E')
+specpath = os.path.join(data_path,'processed-data/family1_TESTTEST')
 
 Path(specpath).mkdir(parents=True, exist_ok=True)
 
@@ -67,7 +67,8 @@ print("Does it exist?", os.path.exists(filenames[0]))
 ### ---------------- Main processing ----------------
 # == Initialize
 MASK_CONTEXT_SEC = 2.0  # Window used for mask calculation
-SAVE_WINDOW_SEC = 0.5   # Final window saved to HDF5
+SAVE_WINDOW_SEC = 0.3   # Final window saved to HDF5
+BUFFER_SEC = 0.02    # 20ms padding around the actual call
 
 write_file_num = 0
 syll_data = {
@@ -78,93 +79,62 @@ syll_data = {
     'audio_filenames':[],
     'location':[]
 }
-sylls_per_file = params['sylls_per_file']
-threshold_db = -60
+sylls_per_file = params['sylls_per_file'] # CHNAGE THIS LATER
+#threshold_db = -60
 
-
-def get_safe_audio_clip(audio, start_sec, duration_sec, fs):
-    """Extracts audio with zero-padding if the window hits file boundaries."""
-    n_samples = int(duration_sec * fs)
-    start_sample = int(start_sec * fs)
-    end_sample = start_sample + n_samples
-
-    # Initialize a buffer of zeros
-    clip = np.zeros(n_samples, dtype=audio.dtype)
-
-    # Calculate valid indices for the source (audio) and destination (clip)
-    src_start = max(0, start_sample)
-    src_end = min(len(audio), end_sample)
-
-    dest_start = max(0, -start_sample)
-    dest_end = dest_start + (src_end - src_start)
-
-    # Paste available audio into the buffer
-    clip[dest_start:dest_end] = audio[src_start:src_end]
-
-    return clip
 
 # == Main loop
-#for onset, offset, fn, loc in tqdm(zip(onsets, offsets, filenames, locs), total=len(filenames)):
 for idx, (onset, offset, fn, loc) in enumerate(tqdm(zip(onsets, offsets, filenames, locs), total=len(filenames))):
 
-    # -- 1. Calculate the context window for cleaning
+    # -- 1. Gatekeeper: Skip Edge Calls
     midpoint = (onset + offset) / 2
-    fs, audio = wavfile.read(fn)
-
-    c_start = midpoint - (MASK_CONTEXT_SEC / 2)
-    c_end = midpoint + (MASK_CONTEXT_SEC / 2)
-
     ml_start = midpoint - (SAVE_WINDOW_SEC / 2)
     ml_end = midpoint + (SAVE_WINDOW_SEC / 2)
 
+    fs, audio = wavfile.read(fn)
+    total_dur = len(audio) / fs
+    if ml_start < 0 or ml_end > total_dur:
+        continue  # Skip call if it's in the very edge - fix later
 
-    # Load raw audio for the context window
-    # Ensure indices are within audio bounds
-    i_start, i_end = int(max(0, c_start * fs)), int(min(len(audio), c_end * fs))
-    audio_ctx = audio[i_start:i_end]
-    p_ctx, _, _, _ = plt.specgram(audio_ctx, NFFT=512, Fs=fs, noverlap=256) # Generate high-res spectrogram for masking
+    # -- 2. Cleaning
+    c_start = max(0, midpoint - (MASK_CONTEXT_SEC / 2))
+    c_end = min(total_dur, midpoint + (MASK_CONTEXT_SEC / 2))
+    audio_ctx = audio[int(c_start * fs): int(c_end * fs)]
+
+    p_ctx, _, bins_ctx, _ = plt.specgram(audio_ctx, NFFT=512, Fs=fs, noverlap=256)
     plt.close()
 
-    # Masking
-    spec_db = 10 * np.log10(p_ctx + 1e-10) # db
-
-    # normalize the Log data
+    spec_db = 10 * np.log10(p_ctx + 1e-10)
     ctx_norm = (spec_db - spec_db.min()) / (spec_db.max() - spec_db.min())
     mask_ctx = apply_zonal_cleaning(ctx_norm, fs)
 
-    # 2. Save call using get_syll_specs
-    if ml_start < 0 or ml_end > (len(audio) / fs):
-        # Use the helper function to create a perfectly centered, padded clip
-        audio_for_ml = get_safe_audio_clip(audio, ml_start, SAVE_WINDOW_SEC, fs)
+    # -- 3. Create the "Call-Only" Mask
+    # Find indices in mask_ctx corresponding to onset-buffer and offset+buffer
+    local_onset = (onset - c_start) - BUFFER_SEC
+    local_offset = (offset - c_start) + BUFFER_SEC
 
-        # Now call get_syll_specs using the PADDED clip
-        # Since audio_for_ml starts EXACTLY at our desired ml_start,
-        # we tell the function the call is now at time 0.25s (the center)
-        spec_list, valid = get_syll_specs([SAVE_WINDOW_SEC / 2], [SAVE_WINDOW_SEC / 2], audio_for_ml, params)
-    else:
-        # Standard call for non-edge cases
-        spec_list, valid = get_syll_specs([ml_start], [ml_end], fn, params)
+    # Create a new blank mask for the call only
+    call_only_mask = np.zeros_like(mask_ctx)
+    call_cols = np.where((bins_ctx >= local_onset) & (bins_ctx <= local_offset))[0]
+    call_only_mask[:, call_cols] = mask_ctx[:, call_cols]
+
+    # -- 4. Extract ML Snippet & Apply Mask
+    spec_list, valid = get_syll_specs([ml_start], [ml_end], fn, params)
 
     if valid:
-        print(f"Processing call {idx}")
-        # get_syll_specs returns a list; take the first spectrogram
         raw_spec = spec_list[0]
 
-        # 3. Crop and Resize the Mask
-        # First: Crop the center (Save Duration) out of the Context Mask
-        total_cols = mask_ctx.shape[1]
-        center_col = total_cols // 2
-        # Calculate how many columns represent the save window
-        half_save_cols = int((SAVE_WINDOW_SEC / MASK_CONTEXT_SEC) * (total_cols / 2))
-        cropped_mask = mask_ctx[:, center_col - half_save_cols: center_col + half_save_cols]
+        # Crop the call-only mask to the 0.3s window
+        actual_dur = c_end - c_start
+        center_col = int(((midpoint - c_start) / actual_dur) * mask_ctx.shape[1])
+        hw = int((SAVE_WINDOW_SEC / actual_dur) * (mask_ctx.shape[1] / 2))
+        cropped_mask = call_only_mask[:, center_col - hw: center_col + hw]
 
-        # Second: Resize to match ML grid dimensions
-
+        # Resize and multiply
         final_mask = resize(cropped_mask, (params['num_freq_bins'], params['num_time_bins']),
                             order=0, preserve_range=True, anti_aliasing=False)
-
-        # 4. Final Cleaned Product
         cleaned_spec = raw_spec * final_mask
+
 
         # Append to Buffer
         syll_data['specs'] += [cleaned_spec]
@@ -182,23 +152,33 @@ for idx, (onset, offset, fn, loc) in enumerate(tqdm(zip(onsets, offsets, filenam
         # -- 7. NEW: Comparison Plotting
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-        # Row 1: The Context Window
-        axes[0, 0].imshow(spec_db, origin='lower', aspect='auto', cmap='magma',extent=[0, MASK_CONTEXT_SEC, 500, 62500])  # the db version
-        axes[0, 0].set_title(f"Raw Context (Call {idx})")
-        axes[0, 0].set_xlabel("Time (sec)")
+        # Get the filename for the title (e.g., channel_1_file_001.wav)
+        base_fn = os.path.basename(fn)
+        main_title = f"Exp: {exp} | File: {base_fn} | Call Index: {idx}"  #
 
-        # Create a masked version of the context for visualization
-        axes[0, 1].imshow(spec_db * mask_ctx, origin='lower', aspect='auto', cmap='magma')
-        axes[0, 1].set_title("Masked Context")
+        # Row 1: The Context Windows (2.0s)
+        # Note: 'extent' is [left, right, bottom, top]
+        ctx_extent = [0, MASK_CONTEXT_SEC, params['min_freq'], params['max_freq']]
 
-        # Row 2: The 0.5s HDF5 Final Slices
-        # Changed final_raw -> raw_spec
-        axes[1, 0].imshow(raw_spec, origin='lower', aspect='auto', cmap='magma')
-        axes[1, 0].set_title(f"Final {SAVE_WINDOW_SEC}s Raw (HDF5)")
+        axes[0, 0].imshow(spec_db, origin='lower', aspect='auto', cmap='magma', extent=ctx_extent)
+        axes[0, 0].set_title(f"{main_title}\nRaw spectrogram")
+        axes[0, 0].set_ylabel("Frequency (Hz)")
 
-        # Changed final_cleaned -> cleaned_spec
-        axes[1, 1].imshow(cleaned_spec, origin='lower', aspect='auto', cmap='magma')
-        axes[1, 1].set_title(f"Final {SAVE_WINDOW_SEC}s Masked (HDF5)")
+        axes[1, 0].imshow(spec_db * mask_ctx, origin='lower', aspect='auto', cmap='magma', extent=ctx_extent)
+        axes[1, 0].set_title("Mask")
+
+        # Row 2: The Final HDF5 Slices (0.3s)
+        # These are centered on the call midpoint
+        save_extent = [0, SAVE_WINDOW_SEC, params['min_freq'], params['max_freq']]
+
+        axes[0, 1].imshow(raw_spec, origin='lower', aspect='auto', cmap='magma', extent=save_extent)
+        axes[0, 1].set_title(f"Final {SAVE_WINDOW_SEC}s Raw (HDF5)")
+        axes[0, 1].set_xlabel("Time (sec)")
+        axes[0, 1].set_ylabel("Frequency (Hz)")
+
+        axes[1, 1].imshow(cleaned_spec, origin='lower', aspect='auto', cmap='magma', extent=save_extent)
+        axes[1, 1].set_title(f"Final {SAVE_WINDOW_SEC}s clean Call (HDF5)")
+        axes[1, 1].set_xlabel("Time (sec)")
 
         # Save the diagnostic plot
         plot_folder = os.path.join(specpath, 'diagnostic_plots')
@@ -206,6 +186,7 @@ for idx, (onset, offset, fn, loc) in enumerate(tqdm(zip(onsets, offsets, filenam
         plt.tight_layout()
         plt.savefig(f"{plot_folder}/call_{idx}_{onset:.2f}s.png")
         plt.close()
+
 
 
     # save to file when batch is full

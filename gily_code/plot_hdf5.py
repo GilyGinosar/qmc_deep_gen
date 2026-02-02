@@ -56,7 +56,7 @@ def plot_and_save_hdf5_inventory(hdf5_path, dataset_key='specs', output_folder=N
 
 
 # Example Usage:
-path_to_plot = r"\\sanesstorage.cns.nyu.edu\archive\ginosar\Processed_data\Audio\237\processed-data\family1_25_1_H\syllables_0002.hdf5"
+path_to_plot = r"\\sanesstorage.cns.nyu.edu\archive\ginosar\Processed_data\Audio\237\processed-data\family1_31_1_B_per_file\file_000.hdf5"
 
 # 1. Get the directory containing the HDF5 file
 base_dir = os.path.dirname(path_to_plot) # This removes 'syllables_0002.hdf5'
